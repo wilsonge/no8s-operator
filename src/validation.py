@@ -44,7 +44,9 @@ def validate_spec_against_schema(
         Tuple of (is_valid, error_message)
     """
     try:
-        validator = Draft7Validator(schema, format_checker=Draft7Validator.FORMAT_CHECKER)
+        validator = Draft7Validator(
+            schema, format_checker=Draft7Validator.FORMAT_CHECKER
+        )
         errors = list(validator.iter_errors(spec))
 
         if not errors:

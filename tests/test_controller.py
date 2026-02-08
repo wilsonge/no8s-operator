@@ -1,11 +1,11 @@
 """Unit tests for controller.py - Main reconciliation controller."""
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 import asyncio
 
 from controller import Controller, ControllerConfig
-from db import ResourceStatus, ReconciliationResult
+from db import ResourceStatus
 from plugins.base import ActionContext, ActionResult, ActionPhase
 
 

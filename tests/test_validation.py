@@ -1,6 +1,5 @@
 """Unit tests for validation.py - OpenAPI v3 schema validation."""
 
-import pytest
 from validation import validate_openapi_schema, validate_spec_against_schema
 
 

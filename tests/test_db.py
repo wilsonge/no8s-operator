@@ -1,6 +1,5 @@
 """Unit tests for db.py - Database manager."""
 
-import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from contextlib import asynccontextmanager
@@ -704,9 +703,7 @@ class TestDatabaseManagerAsync:
             drift_detected=False,
         )
 
-    async def test_initialize_schema_calls_run_migrations(
-        self, db_manager, mock_pool
-    ):
+    async def test_initialize_schema_calls_run_migrations(self, db_manager, mock_pool):
         """Test that initialize_schema delegates to run_migrations."""
         db_manager.pool = mock_pool
 
