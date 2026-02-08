@@ -1,0 +1,11 @@
+.idea
+.claude
+CLAUDE.local.md
+
+# Compiled files
+__pycache__/
+*.py[cod]
+
+# Distribution / packaging
+*.egg-info/
+*.egg

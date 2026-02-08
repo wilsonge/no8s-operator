@@ -1,0 +1,62 @@
+services:
+  # PostgreSQL database for storing resource definitions
+  postgres:
+    image: postgres:16.10
+    container_name: terraform-controller-db
+    environment:
+      POSTGRES_DB: terraform_controller
+      POSTGRES_USER: terraform
+      POSTGRES_PASSWORD: terraform
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U terraform"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # LocalStack for local S3 testing (optional)
+#  localstack:
+#    image: localstack/localstack:latest
+#    container_name: terraform-controller-localstack
+#    ports:
+#      - "4566:4566"
+#    environment:
+#      - SERVICES=s3
+#      - DEBUG=1
+#      - DATA_DIR=/tmp/localstack/data
+#      - DOCKER_HOST=unix:///var/run/docker.sock
+#    volumes:
+#      - localstack_data:/tmp/localstack
+#      - /var/run/docker.sock:/var/run/docker.sock
+
+  # Terraform Controller API
+  controller-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: terraform-controller-api
+    ports:
+      - "8000:8000"
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=terraform_controller
+      - DB_USER=terraform
+      - DB_PASSWORD=terraform
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - GITHUB_ACTIONS_TIMEOUT=${GITHUB_ACTIONS_TIMEOUT:-3600}
+    depends_on:
+      postgres:
+        condition: service_healthy
+#      localstack:
+#        condition: service_started
+    volumes:
+      - terraform_workspaces:/tmp/terraform-workspaces
+
+volumes:
+  postgres_data:
+#  localstack_data:
+  terraform_workspaces:

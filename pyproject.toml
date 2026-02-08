@@ -1,0 +1,70 @@
+[project]
+name = "no8s-operator"
+version = "0.1.0"
+license = "GPL-3.0-or-later"
+description = "A Kubernetes-style operator for managing infrastructure"
+requires-python = ">=3.11"
+dependencies = [
+    # Database
+    "asyncpg==0.31.0",
+    # Web framework
+    "fastapi==0.128.1",
+    "uvicorn[standard]==0.40.0",
+    "pydantic==2.12.5",
+    # AWS SDK for S3 state management
+    "boto3==1.42.42",
+    "botocore==1.42.42",
+    # Async utilities
+    "aiofiles==25.1.0",
+    "aiohttp==3.11.12",
+    # CLI tool dependencies
+    "click==8.3.1",
+    "pyyaml==6.0.3",
+    "tabulate==0.9.0",
+    "requests==2.32.5",
+    # Schema validation
+    "jsonschema==4.23.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "flake8>=7.3.0",
+    "black>=26.1.0",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=6.0.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+
+[tool.coverage.run]
+source = [".", "!tests"]
+omit = ["tests/*", "plugins/*", "main.py", "tfctl.py"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+]
+
+[tool.black]
+line-length = 88
+target-version = ["py311"]
+include = '\.pyi?$'
+exclude = '''
+/(
+    \.git
+    | \.venv
+    | venv
+    | __pycache__
+    | \.eggs
+    | build
+    | dist
+)/
+'''
