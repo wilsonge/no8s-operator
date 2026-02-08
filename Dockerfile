@@ -27,4 +27,4 @@ RUN mkdir -p /tmp/terraform-workspaces
 EXPOSE 8000
 
 # Run the API server
-CMD ["python", "api.py"]
+CMD ["python", "src/main.py"]

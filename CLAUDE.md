@@ -214,7 +214,7 @@ export DB_PASSWORD=operator
 export GITHUB_TOKEN=ghp_your_token_here
 
 # Run the API server
-python main.py
+python src/main.py
 ```
 
 ## Usage
@@ -510,18 +510,20 @@ pytest tests/
 
 ```
 .
-├── controller.py           # Main reconciliation loop
-├── db.py                   # PostgreSQL database manager
-├── validation.py           # OpenAPI v3 schema validation
-├── tests/                  # Contains the test suite for the project
-├── plugins/
-│   └── inputs/
-│       └── http/           # Contains the HTTP Input plugin
-│   └── actions/
-│       └── github_actions/ # Contains the github actions Output plugin
-├── pyproject.toml          # Python dependencies
-├── Dockerfile              # Container image
-├── docker-compose.yml      # Local development setup
+├── src/
+│   ├── controller.py           # Main reconciliation loop
+│   ├── db.py                   # PostgreSQL database manager
+│   ├── validation.py           # OpenAPI v3 schema validation
+│   ├── plugins/
+│   │   └── inputs/
+│   │       └── http/           # Contains the HTTP Input plugin
+│   │   └── actions/
+│   │       └── github_actions/ # Contains the github actions Output plugin
+│   └── migrations/             # SQL migration files
+├── tests/                      # Contains the test suite for the project
+├── pyproject.toml              # Python dependencies
+├── Dockerfile                  # Container image
+├── docker-compose.yml          # Local development setup
 └── CLAUDE.md
 ```
 

@@ -12,7 +12,7 @@ install: ## Install Python dependencies
 dev-setup: ## Set up development environment
 	@echo "Setting up development environment..."
 	pip install -e ".[dev]"
-	chmod +x tfctl.py
+	chmod +x src/tfctl.py
 	@echo "Development environment ready!"
 
 lint: ## Run flake8 linting
@@ -90,29 +90,29 @@ s3-setup: ## Set up S3 bucket for state storage (LocalStack)
 
 # Development shortcuts
 run-api: ## Run API server locally (not in Docker)
-	python api.py
+	python src/main.py
 
 run-controller: ## Run controller locally (not in Docker)
-	python controller.py
+	python src/controller.py
 
 # CLI shortcuts
 cli-apply: ## Apply a resource (usage: make cli-apply FILE=resource.yaml)
-	./tfctl.py apply $(FILE)
+	./src/tfctl.py apply $(FILE)
 
 cli-list: ## List all resources
-	./tfctl.py get
+	./src/tfctl.py get
 
 cli-status: ## Show status of a resource (usage: make cli-status ID=1)
-	./tfctl.py status $(ID)
+	./src/tfctl.py status $(ID)
 
 cli-history: ## Show reconciliation history (usage: make cli-history ID=1)
-	./tfctl.py history $(ID)
+	./src/tfctl.py history $(ID)
 
 cli-outputs: ## Show outputs (usage: make cli-outputs ID=1)
-	./tfctl.py outputs $(ID)
+	./src/tfctl.py outputs $(ID)
 
 cli-delete: ## Delete a resource (usage: make cli-delete ID=1)
-	./tfctl.py delete $(ID)
+	./src/tfctl.py delete $(ID)
 
 # Build
 build: ## Build Docker image
