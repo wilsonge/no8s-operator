@@ -15,26 +15,26 @@ The system follows a delegated controller pattern inspired by Kubernetes:
 │                      Operator Controller                         │
 │                                                                  │
 │  ┌────────────────┐    ┌──────────────────────────────────────┐  │
-│  │  Input Plugins  │───▶│      Main Loop (controller.py)      │  │
+│  │  Input Plugins │───▶│      Main Loop (controller.py)       │  │
 │  │  (HTTP, SQS,   │    │                                      │  │
-│  │   Polling)      │    │  1. Receive resource events          │  │
-│  └────────────────┘    │  2. Cache resource state              │  │
-│                         │  3. Dispatch to reconciler plugin     │  │
-│                         │  4. Update status and metadata        │  │
-│                         └──────────┬───────────────────────────┘  │
-│                                    │                              │
+│  │   Polling)     │    │  1. Receive resource events          │  │
+│  └────────────────┘    │  2. Cache resource state             │  │
+│                        │  3. Dispatch to reconciler plugin    │  │
+│                        │  4. Update status and metadata       │  │
+│                        └──────────┬───────────────────────────┘  │
+│                                    │                             │
 │              ┌─────────────────────┼─────────────────────┐       │
 │              │                     │                     │       │
 │              ▼                     ▼                     ▼       │
-│  ┌───────────────────┐ ┌───────────────────┐ ┌────────────────┐ │
+│  ┌───────────────────┐ ┌───────────────────┐ ┌─────────────────┐ │
 │  │ Reconciler Plugin │ │ Reconciler Plugin │ │Reconciler Plugin│ │
-│  │ (pip: no8s-db)    │ │ (pip: no8s-k8s)   │ │(pip: no8s-dns) │ │
-│  │                   │ │                   │ │                │ │
-│  │ ResourceType:     │ │ ResourceType:     │ │ ResourceType:  │ │
-│  │  DatabaseCluster  │ │  K8sCluster       │ │  DnsRecord     │ │
-│  └────────┬──────────┘ └────────┬──────────┘ └───────┬────────┘ │
-│           │ (optional)          │ (optional)         │ (direct) │
-└───────────┼─────────────────────┼────────────────────┼──────────┘
+│  │ (pip: no8s-db)    │ │ (pip: no8s-k8s)   │ │(pip: no8s-dns)  │ │
+│  │                   │ │                   │ │                 │ │
+│  │ ResourceType:     │ │ ResourceType:     │ │ ResourceType:   │ │
+│  │  DatabaseCluster  │ │  K8sCluster       │ │  DnsRecord      │ │
+│  └────────┬──────────┘ └────────┬──────────┘ └───────┬─────────┘ │
+│           │ (optional)          │ (optional)         │ (direct)  │
+└───────────┼─────────────────────┼────────────────────┼───────────┘
             ▼                     ▼                    ▼
     ┌──────────────┐     ┌──────────────┐      ┌────────────┐
     │ Action Plugin│     │ Action Plugin│      │  External  │
