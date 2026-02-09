@@ -2,6 +2,11 @@
 
 A Kubernetes-style controller for managing infrastructure without Kubernetes. This operator implements a reconciliation loop that continuously ensures your infrastructure matches the desired state defined in your resource specifications.
 
+## WARNING
+This project is being largely "vibe-coded" with minimal human review during the build out phase as I test the limits of
+Claude Code. The intention will be after a first phase to do a full human review of the code. It is the intention to make
+this fully production ready! But be warned if you're looking at it during these early development phases.
+
 ## Overview
 
 no8s-operator brings the power of Kubernetes-style declarative infrastructure management to environments where running a full Kubernetes cluster isn't practical or desired. It supports:
