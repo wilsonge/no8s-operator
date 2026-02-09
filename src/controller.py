@@ -231,13 +231,29 @@ class Controller:
 
                 # Update final status
                 if result.success:
-                    await self.db.update_resource_status(
-                        resource_id,
-                        ResourceStatus.READY,
-                        message="Reconciliation successful",
-                        observed_generation=ctx.generation,
-                    )
-                    logger.info(f"Successfully reconciled {resource_name}")
+                    if resource.get("status") == ResourceStatus.DELETING.value:
+                        # Destroy succeeded — remove our finalizer and
+                        # hard-delete if all finalizers are cleared
+                        await self.db.remove_finalizer(resource_id, action_plugin_name)
+                        remaining = await self.db.get_finalizers(resource_id)
+                        if not remaining:
+                            await self.db.hard_delete_resource(resource_id)
+                            logger.info(
+                                f"Destroyed and deleted resource " f"{resource_name}"
+                            )
+                        else:
+                            logger.info(
+                                f"Finalizer removed for {resource_name}, "
+                                f"waiting on: {remaining}"
+                            )
+                    else:
+                        await self.db.update_resource_status(
+                            resource_id,
+                            ResourceStatus.READY,
+                            message="Reconciliation successful",
+                            observed_generation=ctx.generation,
+                        )
+                        logger.info(f"Successfully reconciled {resource_name}")
                 else:
                     await self.db.update_resource_status(
                         resource_id,

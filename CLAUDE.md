@@ -1,64 +1,80 @@
 # Operator Controller
 
-A Kubernetes-style controller for managing infrastructure. This controller implements a reconciliation loop that continuously ensures your infrastructure matches the desired state defined in your resource specifications.
+A Kubernetes-style controller for managing infrastructure. The operator acts as a central coordinator: it receives resource events via input plugins (HTTP API, queue listeners, polling), caches resource state, and delegates reconciliation to **3rd party reconciler plugins** — each responsible for one or more resource types.
 
-This may be achieved through direct HTTP requests (similar to creating a kubernetes CRD), or by polling other HTTP APIs
-for events or by listening on queues (such as SQS) for events.
+Reconciler plugins are installed as separate pip packages and auto-discovered via Python entry points. Each reconciler owns its own reconciliation loop for its resource types and may optionally use the operator's action plugin system (GitHub Actions, GitLab Pipelines, etc.) to execute changes.
 
-Potential ways to reconcile this loop can be through triggering gitlab pipelines, github actions, or triggering an API.
-
-Each method for receiving and actioning events should be plugin driven.
+Each method for receiving events (inputs) and performing reconciliation (reconcilers) is plugin driven.
 
 ## Architecture
 
-The system follows the Kubernetes controller pattern:
+The system follows a delegated controller pattern inspired by Kubernetes:
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Operator Controller                      │
-│                                                             │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │         Reconciliation Loop (controller.py)          │   │
-│  │                                                      │   │
-│  │  1. Watch for resources needing reconciliation       │   │
-│  │  2. Compare desired state vs actual state            │   │
-│  │  3. Execute Action                                   │   │
-│  │  4. Update status and metadata                       │   │
-│  └──────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-           │                                         │
-           ▼                                         ▼
-    ┌──────────┐                             ┌──────────┐
-    │PostgreSQL│                             │  GitHub  │
-    │          │                             │ Actions  │
-    │ Resource │                             │ Trigger  │
-    │  Store   │                             │          │
-    └──────────┘                             └──────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                      Operator Controller                         │
+│                                                                  │
+│  ┌────────────────┐    ┌──────────────────────────────────────┐  │
+│  │  Input Plugins  │───▶│      Main Loop (controller.py)      │  │
+│  │  (HTTP, SQS,   │    │                                      │  │
+│  │   Polling)      │    │  1. Receive resource events          │  │
+│  └────────────────┘    │  2. Cache resource state              │  │
+│                         │  3. Dispatch to reconciler plugin     │  │
+│                         │  4. Update status and metadata        │  │
+│                         └──────────┬───────────────────────────┘  │
+│                                    │                              │
+│              ┌─────────────────────┼─────────────────────┐       │
+│              │                     │                     │       │
+│              ▼                     ▼                     ▼       │
+│  ┌───────────────────┐ ┌───────────────────┐ ┌────────────────┐ │
+│  │ Reconciler Plugin │ │ Reconciler Plugin │ │Reconciler Plugin│ │
+│  │ (pip: no8s-db)    │ │ (pip: no8s-k8s)   │ │(pip: no8s-dns) │ │
+│  │                   │ │                   │ │                │ │
+│  │ ResourceType:     │ │ ResourceType:     │ │ ResourceType:  │ │
+│  │  DatabaseCluster  │ │  K8sCluster       │ │  DnsRecord     │ │
+│  └────────┬──────────┘ └────────┬──────────┘ └───────┬────────┘ │
+│           │ (optional)          │ (optional)         │ (direct) │
+└───────────┼─────────────────────┼────────────────────┼──────────┘
+            ▼                     ▼                    ▼
+    ┌──────────────┐     ┌──────────────┐      ┌────────────┐
+    │ Action Plugin│     │ Action Plugin│      │  External  │
+    │ (GitHub      │     │ (Terraform)  │      │  API       │
+    │  Actions)    │     │              │      │            │
+    └──────────────┘     └──────────────┘      └────────────┘
+            │
+            ▼
+    ┌──────────┐
+    │PostgreSQL│
+    │ Resource │
+    │  Store   │
+    └──────────┘
 ```
 
 ### Components
 
-1. **Controller (`controller.py`)** - Main reconciliation loop that watches for changes and dispatches to action plugins
-2. **Database Manager (`db.py`)** - PostgreSQL operations for storing resource definitions and metadata
-3. **API Server (`api.py`)** - REST API for submitting and managing resources (input plugin)
-4. **Action Plugins** - Pluggable executors for reconciliation actions:
-   - **GitHub Actions (`github_actions/executor.py`)** - Triggers GitHub Actions workflows and monitors completion
+1. **Main Loop (`controller.py`)** - Receives resource events from input plugins, caches resource state, and dispatches to the appropriate reconciler plugin. Manages lifecycle, status tracking, and audit history.
+2. **Database Manager (`db.py`)** - PostgreSQL operations for storing resource definitions, cached state, and metadata
+3. **Input Plugins** - Pluggable sources for resource events:
+   - **HTTP API (`plugins/inputs/http/`)** - REST API for creating/updating resources directly
+4. **Reconciler Plugins** - 3rd party pip packages that own reconciliation logic per resource type. Discovered via Python entry points.
+5. **Action Plugins** - Optional executors available to reconciler plugins:
+   - **GitHub Actions (`plugins/actions/github_actions/`)** - Triggers GitHub Actions workflows and monitors completion
 
 ## Key Features
 
-- **Declarative Infrastructure**: Define desired state; controller ensures it matches reality
+- **Declarative Infrastructure**: Define desired state; reconciler plugins ensure it matches reality
 - **Resource Types with Schema Validation**: Define resource types with OpenAPI v3 schemas (similar to Kubernetes CRDs)
-- **Extendable**: Plugins can be used to extend it for both inputs and outputs.
-- **PostgreSQL Metadata**: Resource definitions, reconciliation history, and locks (equivalent of ETCD in Kubernetes)
-- **Automatic Reconciliation**: Continuous drift detection and correction
+- **3rd Party Reconcilers**: Reconciliation logic is owned by separately installable pip packages, auto-discovered via Python entry points
+- **Extendable**: Input plugins, reconciler plugins, and action plugins can all be extended independently
+- **PostgreSQL Metadata**: Resource definitions, cached state, reconciliation history, and locks (equivalent of ETCD in Kubernetes)
+- **Automatic Reconciliation**: Continuous drift detection and correction via reconciler plugins
 - **Exponential Backoff**: Failed reconciliations retry with intelligent backoff
 - **Concurrent Reconciliation**: Multiple resources reconciled in parallel
 - **Audit History**: Complete history of all reconciliation attempts
 
 ## Plugin Architecture
 
-The controller is designed around a plugin-based architecture for both inputs (how events are received) and actions (how reconciliation is performed).
+The controller is designed around three plugin types: **input plugins** (how events are received), **reconciler plugins** (how reconciliation is performed per resource type), and **action plugins** (optional executors that reconcilers can delegate to).
 
 ### Input Plugins
 
@@ -68,9 +84,37 @@ Input plugins define how the controller receives events that trigger reconciliat
 - **HTTP Polling** (planned) - Poll external APIs for state changes
 - **Queue Listeners** (planned) - Listen on message queues (SQS, RabbitMQ, etc.)
 
+### Reconciler Plugins
+
+Reconciler plugins are **3rd party packages installed via pip** that own the reconciliation logic for one or more resource types. They are discovered automatically using Python entry points.
+
+**Discovery mechanism:** The operator scans the `no8s.reconcilers` entry point group at startup. Any installed pip package that declares this entry point is automatically registered:
+
+```toml
+# In the 3rd party package's pyproject.toml
+[project.entry-points.'no8s.reconcilers']
+database_cluster = 'no8s_database:DatabaseClusterReconciler'
+```
+
+```python
+# The operator discovers reconcilers at startup
+from importlib.metadata import entry_points
+
+for ep in entry_points(group='no8s.reconcilers'):
+    ReconcilerClass = ep.load()
+    # Register for the resource types it declares
+```
+
+**Key characteristics:**
+- Each reconciler declares which resource type(s) it handles
+- Reconcilers run their own continuous reconciliation loop, reading from the operator's resource cache
+- Reconcilers **may optionally** use action plugins (GitHub Actions, Terraform, etc.) or implement reconciliation directly (e.g. calling an external API)
+- The operator starts/stops reconciler loops alongside its own main loop
+- Multiple reconcilers can coexist, each handling different resource types
+
 ### Action Plugins
 
-Action plugins define how the controller performs reconciliation:
+Action plugins are optional executors that reconciler plugins can use to perform changes. They remain part of the core operator and are available to any reconciler that needs them:
 
 - **GitHub Actions** (implemented) - Trigger GitHub Actions workflows and monitor completion
 - **GitLab Pipelines** (planned) - Trigger GitLab CI/CD pipelines
@@ -197,8 +241,11 @@ docker-compose logs -f controller-api
 ### Manual Installation
 
 ```bash
-# Install dependencies
+# Install the operator
 pip install .
+
+# Install reconciler plugins for your resource types
+pip install no8s-database-reconciler
 
 # Set up PostgreSQL
 createdb operator_controller
@@ -210,7 +257,7 @@ export DB_NAME=operator_controller
 export DB_USER=operator
 export DB_PASSWORD=operator
 
-# GitHub Actions plugin configuration
+# GitHub Actions plugin configuration (if reconcilers use it)
 export GITHUB_TOKEN=ghp_your_token_here
 
 # Run the API server
@@ -219,11 +266,9 @@ python src/main.py
 
 ## Usage
 
-The following examples demonstrate using the GitHub Actions plugin. Other action plugins will have similar patterns but different resource specifications.
-
 ### Creating a Resource
 
-First, ensure a resource type exists (see Resource Types section above). Then create a resource by POSTing to the API:
+First, ensure a resource type exists (see Resource Types section above) and a reconciler plugin is installed for that resource type. Then create a resource by POSTing to the API:
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/resources \
@@ -232,7 +277,6 @@ curl -X POST http://localhost:8000/api/v1/resources \
     "name": "production-pg",
     "resource_type_name": "DatabaseCluster",
     "resource_type_version": "v1",
-    "action_plugin": "github_actions",
     "spec": {
       "engine": "postgres",
       "engine_version": "16.2",
@@ -246,6 +290,8 @@ curl -X POST http://localhost:8000/api/v1/resources \
 ```
 
 The spec is validated against the resource type's OpenAPI v3 schema. If validation fails, the request is rejected with a 400 error.
+If no reconciler exists for the resource type then the request is rejected.
+The operator automatically dispatches to the reconciler plugin registered for the `DatabaseCluster` resource type.
 
 ### Checking Resource Status
 
@@ -262,7 +308,6 @@ curl http://localhost:8000/api/v1/resources/by-name/DatabaseCluster/v1/productio
   "name": "production-pg",
   "resource_type_name": "DatabaseCluster",
   "resource_type_version": "v1",
-  "action_plugin": "github_actions",
   "status": "ready",
   "status_message": "Reconciliation successful",
   "generation": 1,
@@ -293,8 +338,8 @@ curl -X PUT http://localhost:8000/api/v1/resources/1 \
 
 The updated spec is validated against the resource type's schema. This triggers a new reconciliation. The controller will:
 1. Detect the change (generation incremented)
-2. Dispatch to the configured action plugin
-3. Execute the action (e.g. trigger a workflow to resize the cluster)
+2. Dispatch to the reconciler plugin registered for this resource type
+3. The reconciler executes changes (directly or via an action plugin)
 4. Update the status to `ready` once complete
 
 ### Viewing Reconciliation History
@@ -331,9 +376,9 @@ curl http://localhost:8000/api/v1/resources/1/history
 ]
 ```
 
-### Getting Action Outputs
+### Getting Reconciler Outputs
 
-Action plugins can produce outputs. For GitHub Actions resources, this returns workflow job and artifact information:
+Reconciler plugins can produce outputs. For a reconciler using GitHub Actions, this returns workflow job and artifact information:
 
 ```bash
 curl http://localhost:8000/api/v1/resources/1/outputs
@@ -366,7 +411,7 @@ curl http://localhost:8000/api/v1/resources/1/outputs
 curl -X DELETE http://localhost:8000/api/v1/resources/1
 ```
 
-This triggers the action plugin's destroy/cleanup logic. For GitHub Actions resources, this cancels any running workflow.
+This triggers the reconciler plugin's destroy logic. For resources using GitHub Actions, this cancels any running workflow.
 
 ### Manual Reconciliation Trigger
 
@@ -378,12 +423,33 @@ Forces an immediate reconciliation (useful for drift detection).
 
 ## Reconciliation Flow
 
-The controller implements the following reconciliation phases:
+The operator uses a two-tier reconciliation model:
 
-1. **Initializing**: Prepares workspace and initializes the action plugin
-2. **Planning**: Action plugin determines what changes are needed
-3. **Applying**: Action plugin executes the changes
-4. **Completed**: Updates status and metadata
+### Tier 1: Main Loop (Operator)
+
+The main loop is responsible for:
+
+1. **Receiving events** from input plugins (HTTP API, queues, polling)
+2. **Caching resource state** in PostgreSQL
+3. **Starting/stopping** reconciler plugin loops at operator lifecycle boundaries
+4. **Tracking status** and recording reconciliation history
+
+### Tier 2: Reconciler Plugin (3rd Party)
+
+Each reconciler plugin runs its own continuous reconciliation loop for its resource types:
+
+1. **Watch**: Read resources from the operator's cache that need reconciliation
+2. **Reconcile**: Compare desired state against actual state and take action — either directly or via an action plugin
+3. **Report**: Update resource status back through the operator
+
+```
+Main Loop                          Reconciler Plugin Loop
+─────────                          ──────────────────────
+Receive event ──▶ Cache state      Watch cache ──▶ Reconcile ──▶ (Action Plugin)
+                       │                  │                │
+                       └──────────────────┘                │
+Update status ◀── Record history ◀─────── Report ◀────────┘
+```
 
 ### Resource Lifecycle
 
@@ -394,7 +460,7 @@ pending → reconciling → ready
 ```
 
 - **Pending**: Resource created, waiting for first reconciliation
-- **Reconciling**: Action plugin is currently executing
+- **Reconciling**: Reconciler plugin is currently executing
 - **Ready**: Successfully reconciled, matches desired state
 - **Failed**: Reconciliation failed, will retry with backoff
 
@@ -424,7 +490,7 @@ controller = OperatorController(
 
 ### Drift Detection
 
-The controller automatically detects drift every 5 minutes for resources in `ready` state. If drift is detected, it automatically reconciles.
+The main loop schedules re-reconciliation every 5 minutes for resources in `ready` state. The reconciler plugin's plan phase determines if drift has occurred. If drift is detected, it automatically reconciles.
 
 ### Exponential Backoff (TODO)
 
@@ -445,16 +511,17 @@ When `generation > observed_generation`, reconciliation is triggered.
 
 ## Comparison to Kubernetes
 
-| Kubernetes | Operator Controller |
-|------------|---------------------|
-| etcd | PostgreSQL |
-| CustomResourceDefinitions (CRDs) | Resource Types with OpenAPI v3 schemas |
-| Custom Resources | Resources (validated against resource type schema) |
-| Controllers/Operators | Reconciliation loop + action plugins |
-| kubectl apply | POST /api/v1/resources |
-| kubectl get | GET /api/v1/resources |
-| Finalizers | Action plugin destroy on deletion |
-| Status conditions | status + status_message fields |
+| Kubernetes                       | Operator Controller                                          |
+|----------------------------------|--------------------------------------------------------------|
+| etcd                             | PostgreSQL                                                   |
+| CustomResourceDefinitions (CRDs) | Resource Types with OpenAPI v3 schemas                       |
+| Custom Resources                 | Resources (validated against resource type schema)           |
+| Controller Manager               | Main loop (controller.py) — event handling, caching, dispatch|
+| Controllers/Operators            | Reconciler plugins (3rd party pip packages)                  |
+| kubectl apply                    | POST /api/v1/resources                                       |
+| kubectl get                      | GET /api/v1/resources                                        |
+| Finalizers                       | Reconciler plugin destroy on deletion                        |
+| Status conditions                | status + status_message fields                               |
 
 ## Monitoring
 
@@ -511,14 +578,16 @@ pytest tests/
 ```
 .
 ├── src/
-│   ├── controller.py           # Main reconciliation loop
+│   ├── controller.py           # Main loop: event handling, caching, dispatch
 │   ├── db.py                   # PostgreSQL database manager
 │   ├── validation.py           # OpenAPI v3 schema validation
 │   ├── plugins/
-│   │   └── inputs/
-│   │       └── http/           # Contains the HTTP Input plugin
-│   │   └── actions/
-│   │       └── github_actions/ # Contains the github actions Output plugin
+│   │   ├── inputs/
+│   │   │   └── http/           # HTTP Input plugin
+│   │   ├── actions/
+│   │   │   └── github_actions/ # GitHub Actions plugin (used by reconcilers)
+│   │   └── reconcilers/
+│   │       └── base.py         # Base class for reconciler plugins
 │   └── migrations/             # SQL migration files
 ├── tests/                      # Contains the test suite for the project
 ├── pyproject.toml              # Python dependencies
@@ -527,13 +596,107 @@ pytest tests/
 └── CLAUDE.md
 ```
 
+## Developing a Reconciler Plugin
+
+Reconciler plugins are separate pip packages that integrate with the operator via Python entry points. This allows independent development, testing, and release cycles.
+
+### Base Class
+
+Reconciler plugins must subclass `ReconcilerPlugin` and implement the required methods:
+
+```python
+from no8s_operator.plugins.reconcilers.base import ReconcilerPlugin
+
+
+class DatabaseClusterReconciler(ReconcilerPlugin):
+    """Reconciler for DatabaseCluster resources."""
+
+    @property
+    def name(self) -> str:
+        return "database_cluster"
+
+    @property
+    def resource_types(self) -> list[str]:
+        """Resource type names this reconciler handles."""
+        return ["DatabaseCluster"]
+
+    async def start(self, ctx: ReconcilerContext) -> None:
+        """Start the reconciliation loop.
+
+        ctx provides access to the resource cache and action plugin registry.
+        The reconciler should run its own loop, watching the cache for
+        resources that need reconciliation.
+        """
+        while not ctx.shutdown_event.is_set():
+            resources = await ctx.get_resources_needing_reconciliation()
+            for resource in resources:
+                await self.reconcile(resource, ctx)
+            await asyncio.sleep(self.reconcile_interval)
+
+    async def reconcile(self, resource: dict, ctx: ReconcilerContext) -> None:
+        """Reconcile a single resource.
+
+        Compare desired state against actual state and take action.
+        Report status back via ctx.update_status().
+        """
+        await ctx.update_status(resource["id"], "reconciling")
+
+        # Option A: Use an action plugin
+        github = ctx.get_action_plugin("github_actions")
+        await github.apply(action_ctx, workspace)
+
+        # Option B: Call an API directly
+        await httpx.post("https://api.example.com/clusters", json=resource["spec"])
+
+        await ctx.update_status(resource["id"], "ready")
+
+    async def stop(self) -> None:
+        """Graceful shutdown. Clean up any resources."""
+        ...
+```
+
+### Entry Point Registration
+
+Declare the entry point in your package's `pyproject.toml`:
+
+```toml
+[project]
+name = "no8s-database-reconciler"
+version = "0.1.0"
+dependencies = ["no8s-operator"]
+
+[project.entry-points.'no8s.reconcilers']
+database_cluster = 'no8s_database:DatabaseClusterReconciler'
+```
+
+After `pip install no8s-database-reconciler`, the operator will automatically discover and register the reconciler at startup.
+
+### ReconcilerContext
+
+The operator passes a `ReconcilerContext` to each reconciler on startup. This provides access to the resource cache, status reporting, and optionally the action plugin registry:
+
+```python
+# Read from the resource cache
+resources = await ctx.get_resources_needing_reconciliation()
+
+# Report status back to the operator
+await ctx.update_status(resource_id, "ready", message="Reconciled successfully")
+
+# Optionally use an action plugin
+plugin = ctx.get_action_plugin("github_actions")
+```
+
+Reconcilers can implement reconciliation logic entirely on their own without using action plugins.
+
 ## Future Enhancements
 
 - [ ] Multi-controller support with leader election
+- [ ] Roles and authentication
 - [ ] Terraform action plugin
 - [ ] Plan approval workflow
 - [ ] Prometheus metrics
 - [ ] GitOps integration (watch Git repos for changes)
 - [ ] Policy enforcement (OPA integration)
 - [ ] Slack/email notifications
-- [ ] Strong API between plugins so that plugins have a clear integration approach with B/C guarantees
+- [ ] Stable plugin API with backwards-compatibility guarantees
+- [ ] Runtime reconciler hot-reload (detect newly installed packages without restart)

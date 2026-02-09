@@ -58,6 +58,10 @@ class TestController:
         db.mark_resource_for_reconciliation = AsyncMock()
         db.update_resource_outputs = AsyncMock()
         db.requeue_failed_resources = AsyncMock()
+        db.hard_delete_resource = AsyncMock(return_value=True)
+        db.add_finalizer = AsyncMock()
+        db.remove_finalizer = AsyncMock()
+        db.get_finalizers = AsyncMock(return_value=[])
         return db
 
     @pytest.fixture
@@ -159,6 +163,10 @@ class TestControllerAsync:
         db.mark_resource_for_reconciliation = AsyncMock()
         db.update_resource_outputs = AsyncMock()
         db.requeue_failed_resources = AsyncMock()
+        db.hard_delete_resource = AsyncMock(return_value=True)
+        db.add_finalizer = AsyncMock()
+        db.remove_finalizer = AsyncMock()
+        db.get_finalizers = AsyncMock(return_value=[])
         return db
 
     @pytest.fixture
@@ -460,6 +468,43 @@ class TestControllerAsync:
         # Should record failure
         record_call = mock_db.record_reconciliation.call_args
         assert record_call[1]["success"] is False
+
+    async def test_reconcile_resource_delete_success(
+        self, controller, mock_db, mock_registry
+    ):
+        """Test full resource deletion flow calls hard_delete."""
+        mock_plugin = AsyncMock()
+        mock_plugin.prepare = AsyncMock(return_value="/workspace")
+        mock_plugin.plan = AsyncMock(
+            return_value=ActionResult(success=True, has_changes=True)
+        )
+        mock_plugin.destroy = AsyncMock(
+            return_value=ActionResult(
+                success=True,
+                phase=ActionPhase.COMPLETED,
+                resources_deleted=1,
+            )
+        )
+        mock_plugin.cleanup = AsyncMock()
+        mock_registry.get_action_plugin.return_value = mock_plugin
+
+        resource = {
+            "id": 1,
+            "name": "test-resource",
+            "action_plugin": "github_actions",
+            "generation": 1,
+            "observed_generation": 1,
+            "spec": {},
+            "spec_hash": "abc123",
+            "plugin_config": {},
+            "status": ResourceStatus.DELETING.value,
+            "last_reconcile_time": "2024-01-01T00:00:00",
+        }
+
+        await controller._reconcile_resource(resource)
+
+        # Should hard-delete, not set status to READY
+        mock_db.hard_delete_resource.assert_called_once_with(1)
 
     async def test_reconcile_resource_exception(
         self, controller, mock_db, mock_registry

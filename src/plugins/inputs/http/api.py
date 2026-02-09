@@ -195,12 +195,20 @@ class ResourceResponse(BaseModel):
     status_message: Optional[str] = None
     generation: int
     observed_generation: int
+    finalizers: List[str] = []
     created_at: datetime
     updated_at: datetime
     last_reconcile_time: Optional[datetime] = None
 
     class Config:
         from_attributes = True
+
+
+class FinalizersUpdate(BaseModel):
+    """Request model for updating finalizers on a resource."""
+
+    add: List[str] = Field(default_factory=list, description="Finalizers to add")
+    remove: List[str] = Field(default_factory=list, description="Finalizers to remove")
 
 
 class ReconciliationHistoryResponse(BaseModel):
@@ -502,6 +510,7 @@ class HTTPInputPlugin(InputPlugin):
                     spec=resource.spec,
                     plugin_config=resource.plugin_config,
                     metadata=resource.metadata,
+                    finalizers=[resource.action_plugin],
                 )
 
                 # Notify controller of new resource
@@ -675,6 +684,43 @@ class HTTPInputPlugin(InputPlugin):
                 raise
             except Exception as e:
                 logger.error(f"Error deleting resource: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.put("/api/v1/resources/{resource_id}/finalizers")
+        async def update_finalizers(resource_id: int, update: FinalizersUpdate):
+            """Add or remove finalizers from a resource."""
+            if not self._db_manager:
+                raise HTTPException(status_code=503, detail="Database not available")
+
+            try:
+                resource = await self._db_manager.get_resource(resource_id)
+                if not resource:
+                    raise HTTPException(status_code=404, detail="Resource not found")
+
+                for finalizer in update.add:
+                    await self._db_manager.add_finalizer(resource_id, finalizer)
+                for finalizer in update.remove:
+                    await self._db_manager.remove_finalizer(resource_id, finalizer)
+
+                # If deleting and all finalizers cleared, hard-delete
+                if resource.get("status") == "deleting":
+                    remaining = await self._db_manager.get_finalizers(resource_id)
+                    if not remaining:
+                        await self._db_manager.hard_delete_resource(resource_id)
+                        return {
+                            "message": "All finalizers removed, " "resource deleted",
+                            "resource_id": resource_id,
+                        }
+
+                updated = await self._db_manager.get_resource(resource_id)
+                if not updated:
+                    raise HTTPException(status_code=404, detail="Resource not found")
+                return ResourceResponse(**updated)
+
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.error(f"Error updating finalizers: {e}")
                 raise HTTPException(status_code=500, detail=str(e))
 
         @self.app.post("/api/v1/resources/{resource_id}/reconcile", status_code=202)

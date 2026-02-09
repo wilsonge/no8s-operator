@@ -25,6 +25,9 @@ CREATE TABLE IF NOT EXISTS resources (
     last_reconcile_time TIMESTAMP,
     next_reconcile_time TIMESTAMP,
 
+    -- Finalizers (Kubernetes-style deletion protection)
+    finalizers JSONB NOT NULL DEFAULT '[]',
+
     -- Timestamps
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP NOT NULL DEFAULT NOW(),

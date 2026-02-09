@@ -717,6 +717,36 @@ class TestDatabaseManagerAsync:
         with pytest.raises(RuntimeError, match="Database not connected"):
             await db_manager.initialize_schema()
 
+    async def test_hard_delete_resource(self, db_manager, mock_pool):
+        """Test hard-deleting a soft-deleted resource."""
+        db_manager.pool = mock_pool
+
+        @asynccontextmanager
+        async def mock_acquire():
+            conn = AsyncMock()
+            conn.fetchval = AsyncMock(return_value=1)
+            yield conn
+
+        mock_pool.acquire = mock_acquire
+
+        result = await db_manager.hard_delete_resource(1)
+        assert result is True
+
+    async def test_hard_delete_resource_not_found(self, db_manager, mock_pool):
+        """Test hard-deleting a resource that doesn't exist or isn't soft-deleted."""
+        db_manager.pool = mock_pool
+
+        @asynccontextmanager
+        async def mock_acquire():
+            conn = AsyncMock()
+            conn.fetchval = AsyncMock(return_value=None)
+            yield conn
+
+        mock_pool.acquire = mock_acquire
+
+        result = await db_manager.hard_delete_resource(999)
+        assert result is False
+
     async def test_get_reconciliation_history(self, db_manager, mock_pool):
         """Test getting reconciliation history."""
         db_manager.pool = mock_pool

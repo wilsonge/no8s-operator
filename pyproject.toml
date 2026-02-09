@@ -11,9 +11,6 @@ dependencies = [
     "fastapi==0.128.1",
     "uvicorn[standard]==0.40.0",
     "pydantic==2.12.5",
-    # AWS SDK for S3 state management
-    "boto3==1.42.42",
-    "botocore==1.42.42",
     # Async utilities
     "aiofiles==25.1.0",
     "aiohttp==3.11.12",

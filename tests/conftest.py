@@ -49,6 +49,7 @@ def sample_resource():
         "retry_count": 0,
         "last_reconcile_time": None,
         "next_reconcile_time": None,
+        "finalizers": ["github_actions"],
     }
 
 

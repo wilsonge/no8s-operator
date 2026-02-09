@@ -303,6 +303,7 @@ class DatabaseManager:
         spec: Optional[Dict[str, Any]] = None,
         plugin_config: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        finalizers: Optional[List[str]] = None,
     ) -> int:
         """
         Create a new resource.
@@ -315,6 +316,7 @@ class DatabaseManager:
             spec: Resource specification (plugin-specific)
             plugin_config: Plugin configuration (e.g., backend config)
             metadata: Additional metadata
+            finalizers: Initial finalizers list (defaults to [action_plugin])
         """
         if spec is None:
             spec = {}
@@ -325,6 +327,9 @@ class DatabaseManager:
         if metadata is None:
             metadata = {}
 
+        if finalizers is None:
+            finalizers = [action_plugin]
+
         # Calculate spec hash for change detection
         spec_hash = self._calculate_spec_hash(spec)
 
@@ -334,9 +339,9 @@ class DatabaseManager:
                 INSERT INTO resources (
                     name, resource_type_name, resource_type_version,
                     action_plugin, spec, plugin_config, metadata,
-                    spec_hash, status, next_reconcile_time
+                    spec_hash, status, next_reconcile_time, finalizers
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), $10)
                 RETURNING id
                 """,
                 name,
@@ -348,6 +353,7 @@ class DatabaseManager:
                 json.dumps(metadata),
                 spec_hash,
                 ResourceStatus.PENDING.value,
+                json.dumps(finalizers),
             )
 
             logger.info(
@@ -511,7 +517,7 @@ class DatabaseManager:
                 """
                 SELECT *
                 FROM resources
-                WHERE deleted_at IS NULL
+                WHERE (deleted_at IS NULL OR status = 'deleting')
                   AND (
                     -- Never reconciled
                     last_reconcile_time IS NULL
@@ -664,6 +670,106 @@ class DatabaseManager:
                 jitter_factor,
             )
 
+    async def hard_delete_resource(self, resource_id: int) -> bool:
+        """
+        Permanently delete a resource from the database.
+
+        Only succeeds if the resource has been soft-deleted (deleted_at set)
+        and all finalizers have been removed.
+
+        Args:
+            resource_id: The resource ID to permanently delete
+
+        Returns:
+            True if the resource was deleted, False if not found,
+            not soft-deleted, or finalizers remain
+        """
+        async with self.pool.acquire() as conn:
+            result = await conn.fetchval(
+                """
+                DELETE FROM resources
+                WHERE id = $1
+                  AND deleted_at IS NOT NULL
+                  AND finalizers = '[]'::jsonb
+                RETURNING id
+                """,
+                resource_id,
+            )
+            if result:
+                logger.info(f"Hard-deleted resource {resource_id}")
+                return True
+            return False
+
+    async def add_finalizer(self, resource_id: int, finalizer: str) -> None:
+        """
+        Add a finalizer to a resource.
+
+        No-op if the finalizer already exists.
+
+        Args:
+            resource_id: The resource ID
+            finalizer: Finalizer name to add
+        """
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE resources
+                SET finalizers = CASE
+                        WHEN NOT finalizers @> to_jsonb($2::text)
+                        THEN finalizers || to_jsonb($2::text)
+                        ELSE finalizers
+                    END,
+                    updated_at = NOW()
+                WHERE id = $1
+                """,
+                resource_id,
+                finalizer,
+            )
+
+    async def remove_finalizer(self, resource_id: int, finalizer: str) -> None:
+        """
+        Remove a finalizer from a resource.
+
+        Args:
+            resource_id: The resource ID
+            finalizer: Finalizer name to remove
+        """
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE resources
+                SET finalizers = COALESCE(
+                        (SELECT jsonb_agg(elem)
+                         FROM jsonb_array_elements(finalizers) AS elem
+                         WHERE elem #>> '{}' != $2),
+                        '[]'::jsonb
+                    ),
+                    updated_at = NOW()
+                WHERE id = $1
+                """,
+                resource_id,
+                finalizer,
+            )
+
+    async def get_finalizers(self, resource_id: int) -> List[str]:
+        """
+        Get the finalizers list for a resource.
+
+        Args:
+            resource_id: The resource ID
+
+        Returns:
+            List of finalizer names, or empty list if resource not found
+        """
+        async with self.pool.acquire() as conn:
+            result = await conn.fetchval(
+                "SELECT finalizers FROM resources WHERE id = $1",
+                resource_id,
+            )
+            if result is None:
+                return []
+            return json.loads(result) if isinstance(result, str) else result
+
     async def mark_resource_for_reconciliation(self, resource_id: int):
         """Manually trigger reconciliation for a resource."""
         async with self.pool.acquire() as conn:
@@ -740,6 +846,11 @@ class DatabaseManager:
         )
         result["outputs"] = (
             json.loads(result["outputs"]) if result.get("outputs") else {}
+        )
+        result["finalizers"] = (
+            json.loads(result["finalizers"])
+            if isinstance(result.get("finalizers"), str)
+            else result.get("finalizers", []) or []
         )
         return result
 
