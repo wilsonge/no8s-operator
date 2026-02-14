@@ -9,11 +9,13 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from db import DatabaseManager, ReconciliationResult, ResourceStatus
+from events import EventBus, EventType, ResourceEvent
 from plugins import ActionContext, get_registry
 from plugins.actions.base import ActionPlugin
+from plugins.reconcilers.base import ReconcilerContext
 from plugins.registry import PluginRegistry
 
 logging.basicConfig(
@@ -45,7 +47,8 @@ class Controller:
     Main controller that implements the reconciliation loop.
 
     Watches for resources that need reconciliation and dispatches to the
-    appropriate action plugin for execution.
+    appropriate action plugin for execution. Also starts and stops
+    reconciler plugin loops for resource types claimed by reconcilers.
     """
 
     def __init__(
@@ -53,6 +56,7 @@ class Controller:
         db_manager: DatabaseManager,
         registry: Optional[PluginRegistry] = None,
         config: Optional[ControllerConfig] = None,
+        event_bus: Optional[EventBus] = None,
     ):
         self.db = db_manager
         self.registry = registry or get_registry()
@@ -61,9 +65,14 @@ class Controller:
         self.max_concurrent_reconciles = self.config.max_concurrent_reconciles
         self.semaphore = asyncio.Semaphore(self.max_concurrent_reconciles)
         self.running = False
+        self._event_bus = event_bus
 
         # Cache of initialized action plugins
         self._action_plugins: Dict[str, ActionPlugin] = {}
+
+        # Reconciler plugin management
+        self._shutdown_event = asyncio.Event()
+        self._reconciler_tasks: List[asyncio.Task] = []
 
     async def _get_action_plugin(
         self, name: str, config: Optional[Dict[str, Any]] = None
@@ -97,9 +106,13 @@ class Controller:
         return self._action_plugins[name]
 
     async def start(self):
-        """Start the controller reconciliation loop."""
+        """Start the controller reconciliation loop and reconciler plugins."""
         logger.info("Starting Operator Controller")
         self.running = True
+        self._shutdown_event.clear()
+
+        # Start reconciler plugins
+        await self._start_reconcilers()
 
         # Start the main reconciliation loop
         reconcile_task = asyncio.create_task(self._reconciliation_loop())
@@ -108,15 +121,58 @@ class Controller:
         requeue_task = asyncio.create_task(self._requeue_loop())
 
         try:
-            await asyncio.gather(reconcile_task, requeue_task)
+            await asyncio.gather(reconcile_task, requeue_task, *self._reconciler_tasks)
         except Exception as e:
             logger.error(f"Controller error: {e}")
             raise
 
     async def stop(self):
-        """Stop the controller gracefully."""
+        """Stop the controller and all reconciler plugins gracefully."""
         logger.info("Stopping Operator Controller")
         self.running = False
+        self._shutdown_event.set()
+
+        await self._stop_reconcilers()
+
+    async def _start_reconcilers(self) -> None:
+        """Start all registered reconciler plugin loops."""
+        reconciler_ctx = ReconcilerContext(
+            db=self.db,
+            registry=self.registry,
+            shutdown_event=self._shutdown_event,
+        )
+
+        for reconciler_name in self.registry.list_reconciler_plugins():
+            reconciler = self.registry.get_reconciler_plugin(reconciler_name)
+            task = asyncio.create_task(self._run_reconciler(reconciler, reconciler_ctx))
+            self._reconciler_tasks.append(task)
+            logger.info(f"Started reconciler plugin: {reconciler_name}")
+
+    async def _run_reconciler(self, reconciler: Any, ctx: ReconcilerContext) -> None:
+        """Run a reconciler plugin, catching exceptions."""
+        try:
+            await reconciler.start(ctx)
+        except Exception as e:
+            logger.error(
+                f"Reconciler plugin '{reconciler.name}' crashed: {e}",
+                exc_info=True,
+            )
+
+    async def _stop_reconcilers(self) -> None:
+        """Stop all running reconciler plugins."""
+        for reconciler_name in self.registry.list_reconciler_plugins():
+            try:
+                reconciler = self.registry.get_reconciler_plugin(reconciler_name)
+                await reconciler.stop()
+                logger.info(f"Stopped reconciler plugin: {reconciler_name}")
+            except Exception as e:
+                logger.error(f"Error stopping reconciler '{reconciler_name}': {e}")
+
+        # Cancel any remaining reconciler tasks
+        for task in self._reconciler_tasks:
+            if not task.done():
+                task.cancel()
+        self._reconciler_tasks.clear()
 
     async def _reconciliation_loop(self):
         """Main reconciliation loop - watches for resources needing reconciliation."""
@@ -254,6 +310,15 @@ class Controller:
                             observed_generation=ctx.generation,
                         )
                         logger.info(f"Successfully reconciled {resource_name}")
+
+                        # Publish RECONCILED event
+                        if self._event_bus:
+                            updated_resource = await self.db.get_resource(resource_id)
+                            if updated_resource:
+                                event = ResourceEvent.from_resource(
+                                    EventType.RECONCILED, updated_resource
+                                )
+                                await self._event_bus.publish(event)
                 else:
                     await self.db.update_resource_status(
                         resource_id,

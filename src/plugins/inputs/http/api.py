@@ -5,6 +5,7 @@ This plugin provides a FastAPI-based REST API for creating, updating,
 and managing infrastructure resources.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -14,8 +15,11 @@ from typing import Any, Dict, List, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
+from admission import AdmissionChain, AdmissionError, AdmissionRequest
+from events import EventBus, EventType, ResourceEvent
 from plugins.base import ResourceSpec
 from plugins.inputs.base import InputPlugin, ResourceCallback, validate_action_plugin
 from validation import validate_openapi_schema, validate_spec_against_schema
@@ -125,8 +129,10 @@ class ResourceCreate(BaseModel):
     resource_type_version: str = Field(
         ..., description="Resource type version", example="v1"
     )
-    action_plugin: str = Field(
-        default="terraform", description="Action plugin to use for reconciliation"
+    action_plugin: Optional[str] = Field(
+        default=None,
+        description="Action plugin to use for reconciliation "
+        "(optional if a reconciler plugin handles this resource type)",
     )
     spec: Optional[Dict[str, Any]] = Field(
         default=None, description="Resource specification (plugin-specific)"
@@ -190,7 +196,7 @@ class ResourceResponse(BaseModel):
     name: str
     resource_type_name: str
     resource_type_version: str
-    action_plugin: str = "terraform"
+    action_plugin: Optional[str] = None
     status: str
     status_message: Optional[str] = None
     generation: int
@@ -226,6 +232,118 @@ class ReconciliationHistoryResponse(BaseModel):
     reconcile_time: datetime
 
 
+# Admission Webhook models
+
+
+class AdmissionWebhookCreate(BaseModel):
+    """Request model for creating an admission webhook."""
+
+    name: str = Field(..., description="Unique webhook name")
+    webhook_url: str = Field(..., description="HTTP endpoint to call")
+    webhook_type: str = Field(
+        ..., description="Webhook type: 'validating' or 'mutating'"
+    )
+    operations: List[str] = Field(
+        ..., description="Operations to intercept: CREATE, UPDATE, DELETE"
+    )
+    resource_type_name: Optional[str] = Field(
+        None, description="Target resource type (null = all types)"
+    )
+    resource_type_version: Optional[str] = Field(
+        None, description="Target version (null = all versions)"
+    )
+    timeout_seconds: int = Field(default=10, description="HTTP timeout")
+    failure_policy: str = Field(
+        default="Fail", description="'Fail' or 'Ignore' on webhook error"
+    )
+    ordering: int = Field(default=0, description="Execution order (lower = first)")
+
+    @field_validator("webhook_type")
+    @classmethod
+    def validate_webhook_type(cls, v: str) -> str:
+        if v not in ("validating", "mutating"):
+            raise ValueError("webhook_type must be 'validating' or 'mutating'")
+        return v
+
+    @field_validator("operations")
+    @classmethod
+    def validate_operations(cls, v: List[str]) -> List[str]:
+        valid = {"CREATE", "UPDATE", "DELETE"}
+        for op in v:
+            if op not in valid:
+                raise ValueError(
+                    f"Invalid operation '{op}'. Must be one of: CREATE, UPDATE, DELETE"
+                )
+        return v
+
+    @field_validator("failure_policy")
+    @classmethod
+    def validate_failure_policy(cls, v: str) -> str:
+        if v not in ("Fail", "Ignore"):
+            raise ValueError("failure_policy must be 'Fail' or 'Ignore'")
+        return v
+
+
+class AdmissionWebhookUpdate(BaseModel):
+    """Request model for updating an admission webhook."""
+
+    webhook_url: Optional[str] = None
+    webhook_type: Optional[str] = None
+    operations: Optional[List[str]] = None
+    resource_type_name: Optional[str] = None
+    resource_type_version: Optional[str] = None
+    timeout_seconds: Optional[int] = None
+    failure_policy: Optional[str] = None
+    ordering: Optional[int] = None
+
+    @field_validator("webhook_type")
+    @classmethod
+    def validate_webhook_type(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in ("validating", "mutating"):
+            raise ValueError("webhook_type must be 'validating' or 'mutating'")
+        return v
+
+    @field_validator("operations")
+    @classmethod
+    def validate_operations(cls, v: Optional[List[str]]) -> Optional[List[str]]:
+        if v is not None:
+            valid = {"CREATE", "UPDATE", "DELETE"}
+            for op in v:
+                if op not in valid:
+                    raise ValueError(
+                        f"Invalid operation '{op}'. "
+                        f"Must be one of: CREATE, UPDATE, DELETE"
+                    )
+        return v
+
+    @field_validator("failure_policy")
+    @classmethod
+    def validate_failure_policy(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in ("Fail", "Ignore"):
+            raise ValueError("failure_policy must be 'Fail' or 'Ignore'")
+        return v
+
+
+class AdmissionWebhookResponse(BaseModel):
+    """Response model for an admission webhook."""
+
+    id: int
+    name: str
+    webhook_url: str
+    webhook_type: str
+    operations: List[str]
+    resource_type_name: Optional[str] = None
+    resource_type_version: Optional[str] = None
+    timeout_seconds: int = 10
+    failure_policy: str = "Fail"
+    ordering: int = 0
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
 class PluginInfo(BaseModel):
     """Response model for plugin information."""
 
@@ -247,6 +365,8 @@ class HTTPInputPlugin(InputPlugin):
         self.server = None
         self._on_resource_event: Optional[ResourceCallback] = None
         self._db_manager = None
+        self._admission_chain: Optional[AdmissionChain] = None
+        self._event_bus: Optional[EventBus] = None
         self._config: Dict[str, Any] = {}
 
     @property
@@ -283,6 +403,11 @@ class HTTPInputPlugin(InputPlugin):
     def set_db_manager(self, db_manager) -> None:
         """Set the database manager instance."""
         self._db_manager = db_manager
+        self._admission_chain = AdmissionChain(db_manager)
+
+    def set_event_bus(self, event_bus: EventBus) -> None:
+        """Set the event bus instance for publishing and streaming events."""
+        self._event_bus = event_bus
 
     def _setup_routes(self) -> None:
         """
@@ -468,10 +593,29 @@ class HTTPInputPlugin(InputPlugin):
             if not self._db_manager:
                 raise HTTPException(status_code=503, detail="Database not available")
 
-            # Validate action plugin exists
-            validation = validate_action_plugin(resource.action_plugin)
-            if not validation.is_valid:
-                raise HTTPException(status_code=400, detail=validation.error_message)
+            from plugins.registry import get_registry
+
+            registry = get_registry()
+
+            # Check if a reconciler handles this resource type
+            has_reconciler = registry.has_reconciler_for_resource_type(
+                resource.resource_type_name
+            )
+
+            # Validate that either a reconciler or action plugin is available
+            if resource.action_plugin:
+                validation = validate_action_plugin(resource.action_plugin)
+                if not validation.is_valid:
+                    raise HTTPException(
+                        status_code=400, detail=validation.error_message
+                    )
+            elif not has_reconciler:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"No reconciler plugin registered for resource "
+                    f"type '{resource.resource_type_name}' and no "
+                    f"action_plugin specified",
+                )
 
             try:
                 # Validate spec is present
@@ -502,29 +646,62 @@ class HTTPInputPlugin(InputPlugin):
                         detail=f"Spec validation failed: {error}",
                     )
 
+                # Run admission webhooks
+                spec_to_use = resource.spec
+                if self._admission_chain:
+                    try:
+                        admission_req = AdmissionRequest(
+                            operation="CREATE",
+                            resource={
+                                "name": resource.name,
+                                "resource_type_name": resource.resource_type_name,
+                                "resource_type_version": resource.resource_type_version,
+                                "spec": resource.spec,
+                            },
+                        )
+                        spec_to_use = await self._admission_chain.run(admission_req)
+                    except AdmissionError as e:
+                        raise HTTPException(status_code=403, detail=e.message)
+
+                # Build finalizers list
+                finalizers = []
+                if resource.action_plugin:
+                    finalizers.append(resource.action_plugin)
+                elif has_reconciler:
+                    reconciler = registry.get_reconciler_for_resource_type(
+                        resource.resource_type_name
+                    )
+                    finalizers.append(reconciler.name)
+
                 resource_id = await self._db_manager.create_resource(
                     name=resource.name,
                     resource_type_name=resource.resource_type_name,
                     resource_type_version=resource.resource_type_version,
-                    action_plugin=resource.action_plugin,
-                    spec=resource.spec,
+                    action_plugin=resource.action_plugin or "",
+                    spec=spec_to_use,
                     plugin_config=resource.plugin_config,
                     metadata=resource.metadata,
-                    finalizers=[resource.action_plugin],
+                    finalizers=finalizers,
                 )
 
                 # Notify controller of new resource
                 if self._on_resource_event:
                     spec = ResourceSpec(
                         name=resource.name,
-                        action_plugin=resource.action_plugin,
-                        spec=resource.spec,
+                        action_plugin=resource.action_plugin or "",
+                        spec=spec_to_use,
                         plugin_config=resource.plugin_config,
                         metadata=resource.metadata,
                     )
                     await self._on_resource_event("created", spec)
 
                 created = await self._db_manager.get_resource(resource_id)
+
+                # Publish CREATED event
+                if self._event_bus and created:
+                    event = ResourceEvent.from_resource(EventType.CREATED, created)
+                    await self._event_bus.publish(event)
+
                 return ResourceResponse(**created)
 
             except HTTPException:
@@ -612,6 +789,7 @@ class HTTPInputPlugin(InputPlugin):
                     raise HTTPException(status_code=404, detail="Resource not found")
 
                 # If spec is being updated, validate against schema
+                spec_to_use = update.spec
                 if update.spec is not None:
                     rt = await self._db_manager.get_resource_type_by_name_version(
                         current["resource_type_name"],
@@ -627,9 +805,28 @@ class HTTPInputPlugin(InputPlugin):
                                 detail=f"Spec validation failed: {error}",
                             )
 
+                    # Run admission webhooks
+                    if self._admission_chain:
+                        try:
+                            admission_req = AdmissionRequest(
+                                operation="UPDATE",
+                                resource={
+                                    "name": current["name"],
+                                    "resource_type_name": current["resource_type_name"],
+                                    "resource_type_version": current[
+                                        "resource_type_version"
+                                    ],
+                                    "spec": update.spec,
+                                },
+                                old_resource=current,
+                            )
+                            spec_to_use = await self._admission_chain.run(admission_req)
+                        except AdmissionError as e:
+                            raise HTTPException(status_code=403, detail=e.message)
+
                 await self._db_manager.update_resource(
                     resource_id=resource_id,
-                    spec=update.spec,
+                    spec=spec_to_use,
                     plugin_config=update.plugin_config,
                 )
 
@@ -644,6 +841,11 @@ class HTTPInputPlugin(InputPlugin):
                         plugin_config=updated.get("plugin_config"),
                     )
                     await self._on_resource_event("updated", spec)
+
+                # Publish MODIFIED event
+                if self._event_bus and updated:
+                    event = ResourceEvent.from_resource(EventType.MODIFIED, updated)
+                    await self._event_bus.publish(event)
 
                 return ResourceResponse(**updated)
 
@@ -664,6 +866,24 @@ class HTTPInputPlugin(InputPlugin):
                 if not resource:
                     raise HTTPException(status_code=404, detail="Resource not found")
 
+                # Run admission webhooks
+                if self._admission_chain:
+                    try:
+                        admission_req = AdmissionRequest(
+                            operation="DELETE",
+                            resource={
+                                "name": resource["name"],
+                                "resource_type_name": resource["resource_type_name"],
+                                "resource_type_version": resource[
+                                    "resource_type_version"
+                                ],
+                                "spec": resource.get("spec", {}),
+                            },
+                        )
+                        await self._admission_chain.run(admission_req)
+                    except AdmissionError as e:
+                        raise HTTPException(status_code=403, detail=e.message)
+
                 await self._db_manager.delete_resource(resource_id)
 
                 # Notify controller
@@ -674,6 +894,11 @@ class HTTPInputPlugin(InputPlugin):
                         spec=resource.get("spec", {}),
                     )
                     await self._on_resource_event("deleted", spec)
+
+                # Publish DELETED event
+                if self._event_bus:
+                    event = ResourceEvent.from_resource(EventType.DELETED, resource)
+                    await self._event_bus.publish(event)
 
                 return {
                     "message": "Resource marked for deletion",
@@ -802,6 +1027,225 @@ class HTTPInputPlugin(InputPlugin):
                 if info:
                     plugins.append(PluginInfo(**info))
             return plugins
+
+        # ==================== Admission Webhook Endpoints ====================
+
+        @self.app.post(
+            "/api/v1/admission-webhooks",
+            response_model=AdmissionWebhookResponse,
+            status_code=201,
+        )
+        async def create_admission_webhook(webhook: AdmissionWebhookCreate):
+            """Register an admission webhook."""
+            if not self._db_manager:
+                raise HTTPException(status_code=503, detail="Database not available")
+
+            try:
+                wh_id = await self._db_manager.create_admission_webhook(
+                    name=webhook.name,
+                    webhook_url=webhook.webhook_url,
+                    webhook_type=webhook.webhook_type,
+                    operations=webhook.operations,
+                    resource_type_name=webhook.resource_type_name,
+                    resource_type_version=webhook.resource_type_version,
+                    timeout_seconds=webhook.timeout_seconds,
+                    failure_policy=webhook.failure_policy,
+                    ordering=webhook.ordering,
+                )
+                created = await self._db_manager.get_admission_webhook(wh_id)
+                return AdmissionWebhookResponse(**created)
+            except Exception as e:
+                if "unique constraint" in str(e).lower():
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Admission webhook '{webhook.name}' " f"already exists",
+                    )
+                logger.error(f"Error creating admission webhook: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.get(
+            "/api/v1/admission-webhooks",
+            response_model=List[AdmissionWebhookResponse],
+        )
+        async def list_admission_webhooks(
+            resource_type_name: Optional[str] = None,
+            resource_type_version: Optional[str] = None,
+            webhook_type: Optional[str] = None,
+        ):
+            """List admission webhooks."""
+            if not self._db_manager:
+                raise HTTPException(status_code=503, detail="Database not available")
+
+            try:
+                webhooks = await self._db_manager.list_admission_webhooks(
+                    resource_type_name=resource_type_name,
+                    resource_type_version=resource_type_version,
+                    webhook_type=webhook_type,
+                )
+                return [AdmissionWebhookResponse(**w) for w in webhooks]
+            except Exception as e:
+                logger.error(f"Error listing admission webhooks: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.get(
+            "/api/v1/admission-webhooks/{webhook_id}",
+            response_model=AdmissionWebhookResponse,
+        )
+        async def get_admission_webhook(webhook_id: int):
+            """Get an admission webhook by ID."""
+            if not self._db_manager:
+                raise HTTPException(status_code=503, detail="Database not available")
+
+            try:
+                webhook = await self._db_manager.get_admission_webhook(webhook_id)
+                if not webhook:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Admission webhook not found",
+                    )
+                return AdmissionWebhookResponse(**webhook)
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.error(f"Error getting admission webhook: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.put(
+            "/api/v1/admission-webhooks/{webhook_id}",
+            response_model=AdmissionWebhookResponse,
+        )
+        async def update_admission_webhook(
+            webhook_id: int, update: AdmissionWebhookUpdate
+        ):
+            """Update an admission webhook."""
+            if not self._db_manager:
+                raise HTTPException(status_code=503, detail="Database not available")
+
+            try:
+                await self._db_manager.update_admission_webhook(
+                    webhook_id=webhook_id,
+                    webhook_url=update.webhook_url,
+                    webhook_type=update.webhook_type,
+                    operations=update.operations,
+                    resource_type_name=update.resource_type_name,
+                    resource_type_version=update.resource_type_version,
+                    timeout_seconds=update.timeout_seconds,
+                    failure_policy=update.failure_policy,
+                    ordering=update.ordering,
+                )
+                updated = await self._db_manager.get_admission_webhook(webhook_id)
+                if not updated:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Admission webhook not found",
+                    )
+                return AdmissionWebhookResponse(**updated)
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.error(f"Error updating admission webhook: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.delete("/api/v1/admission-webhooks/{webhook_id}", status_code=204)
+        async def delete_admission_webhook(webhook_id: int):
+            """Delete an admission webhook."""
+            if not self._db_manager:
+                raise HTTPException(status_code=503, detail="Database not available")
+
+            try:
+                deleted = await self._db_manager.delete_admission_webhook(webhook_id)
+                if not deleted:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Admission webhook not found",
+                    )
+                return None
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.error(f"Error deleting admission webhook: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        # ==================== Event Streaming Endpoints ====================
+
+        @self.app.get("/api/v1/events")
+        async def stream_all_events(resource_type: Optional[str] = None):
+            """SSE stream of all resource events.
+
+            Optionally filter by resource type name.
+            """
+            if not self._event_bus:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Event streaming not available",
+                )
+
+            if resource_type:
+                rt_name = resource_type
+
+                def filter_fn(event: ResourceEvent) -> bool:
+                    return event.resource_type_name == rt_name
+
+            else:
+                filter_fn = None
+
+            subscriber_id, subscription = await self._event_bus.subscribe(filter_fn)
+
+            async def event_generator():
+                try:
+                    async for event in subscription:
+                        yield event.to_sse()
+                except asyncio.CancelledError:
+                    pass
+                finally:
+                    await self._event_bus.unsubscribe(subscriber_id)
+
+            return StreamingResponse(
+                event_generator(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+
+        @self.app.get("/api/v1/resources/{resource_id}/events")
+        async def stream_resource_events(resource_id: int):
+            """SSE stream for a specific resource."""
+            if not self._db_manager:
+                raise HTTPException(status_code=503, detail="Database not available")
+            if not self._event_bus:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Event streaming not available",
+                )
+
+            resource = await self._db_manager.get_resource(resource_id)
+            if not resource:
+                raise HTTPException(status_code=404, detail="Resource not found")
+
+            def filter_fn(event: ResourceEvent) -> bool:
+                return event.resource_id == resource_id
+
+            subscriber_id, subscription = await self._event_bus.subscribe(filter_fn)
+
+            async def event_generator():
+                try:
+                    async for event in subscription:
+                        yield event.to_sse()
+                except asyncio.CancelledError:
+                    pass
+                finally:
+                    await self._event_bus.unsubscribe(subscriber_id)
+
+            return StreamingResponse(
+                event_generator(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                },
+            )
 
     async def start(self, on_resource_event: ResourceCallback) -> None:
         """Start the HTTP server."""

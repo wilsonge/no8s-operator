@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 from config import get_config
 from controller import Controller, ControllerConfig
 from db import DatabaseManager
+from events import EventBus
 from plugins.registry import get_registry, register_builtin_plugins
 from plugins.inputs.base import InputPlugin
 
@@ -29,6 +30,7 @@ class Application:
         self.config = get_config()
         self.db: Optional[DatabaseManager] = None
         self.controller: Optional[Controller] = None
+        self.event_bus: Optional[EventBus] = None
         self.input_plugins: List[InputPlugin] = []
         self.running = False
 
@@ -54,6 +56,9 @@ class Application:
         await self.db.connect()
         await self.db.initialize_schema()
         logger.info("Database initialized")
+
+        # Initialize event bus
+        self.event_bus = EventBus()
 
         # Build plugin configs from registry (plugins define their own env loading)
         # Config can override with PLUGIN_CONFIGS env var
@@ -81,6 +86,7 @@ class Application:
             db_manager=self.db,
             registry=registry,
             config=controller_config,
+            event_bus=self.event_bus,
         )
 
         # Determine which input plugins to load
@@ -101,6 +107,7 @@ class Application:
 
             plugin = await registry.get_input_plugin(plugin_name, plugin_config)
             plugin.set_db_manager(self.db)
+            plugin.set_event_bus(self.event_bus)
             self.input_plugins.append(plugin)
             logger.info(f"Initialized input plugin: {plugin_name}")
 

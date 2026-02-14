@@ -148,3 +148,14 @@ class InputPlugin(ABC):
             db_manager: The DatabaseManager instance
         """
         pass
+
+    def set_event_bus(self, event_bus: Any) -> None:
+        """
+        Set the event bus for plugins that publish or stream events.
+
+        Override this method in subclasses that require event bus access.
+
+        Args:
+            event_bus: The EventBus instance
+        """
+        pass

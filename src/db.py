@@ -546,6 +546,66 @@ class DatabaseManager:
 
             return [self._parse_resource_row(row) for row in rows]
 
+    async def get_resources_needing_reconciliation_by_type(
+        self,
+        resource_type_names: List[str],
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """
+        Get resources that need reconciliation, filtered by resource type names.
+
+        Args:
+            resource_type_names: List of resource type names to filter by.
+            limit: Maximum number of resources to return.
+
+        Returns:
+            List of resource dicts needing reconciliation.
+        """
+        if not resource_type_names:
+            return []
+
+        async with self.pool.acquire() as conn:
+            # Build placeholders for the IN clause
+            placeholders = ", ".join(
+                f"${i + 1}" for i in range(len(resource_type_names))
+            )
+            limit_param = f"${len(resource_type_names) + 1}"
+
+            rows = await conn.fetch(
+                f"""
+                SELECT *
+                FROM resources
+                WHERE (deleted_at IS NULL OR status = 'deleting')
+                  AND resource_type_name IN ({placeholders})
+                  AND (
+                    -- Never reconciled
+                    last_reconcile_time IS NULL
+                    -- Generation changed
+                    OR generation > observed_generation
+                    -- Scheduled for reconciliation
+                    OR next_reconcile_time <= NOW()
+                    -- Failed and ready for retry
+                    OR (status = 'failed' AND next_reconcile_time <= NOW())
+                    -- Marked for deletion
+                    OR status = 'deleting'
+                  )
+                  AND status != 'reconciling'
+                ORDER BY
+                    CASE status
+                        WHEN 'deleting' THEN 0
+                        WHEN 'pending' THEN 1
+                        WHEN 'failed' THEN 2
+                        ELSE 3
+                    END,
+                    next_reconcile_time ASC NULLS FIRST
+                LIMIT {limit_param}
+                """,
+                *resource_type_names,
+                limit,
+            )
+
+            return [self._parse_resource_row(row) for row in rows]
+
     async def update_resource_status(
         self,
         resource_id: int,
@@ -858,3 +918,241 @@ class DatabaseManager:
         """Calculate a hash of the resource specification for change detection."""
         spec_string = json.dumps(spec, sort_keys=True)
         return hashlib.sha256(spec_string.encode()).hexdigest()
+
+    # ==================== Admission Webhook Methods ====================
+
+    async def create_admission_webhook(
+        self,
+        name: str,
+        webhook_url: str,
+        webhook_type: str,
+        operations: List[str],
+        resource_type_name: Optional[str] = None,
+        resource_type_version: Optional[str] = None,
+        timeout_seconds: int = 10,
+        failure_policy: str = "Fail",
+        ordering: int = 0,
+    ) -> int:
+        """
+        Create an admission webhook.
+
+        Args:
+            name: Unique webhook name
+            webhook_url: HTTP endpoint to call
+            webhook_type: 'validating' or 'mutating'
+            operations: List of operations to intercept (CREATE, UPDATE, DELETE)
+            resource_type_name: Target resource type (None = all types)
+            resource_type_version: Target version (None = all versions)
+            timeout_seconds: HTTP timeout for the webhook call
+            failure_policy: 'Fail' or 'Ignore'
+            ordering: Execution order (lower = first)
+
+        Returns:
+            The webhook ID.
+        """
+        async with self.pool.acquire() as conn:
+            webhook_id = await conn.fetchval(
+                """
+                INSERT INTO admission_webhooks (
+                    name, webhook_url, webhook_type, operations,
+                    resource_type_name, resource_type_version,
+                    timeout_seconds, failure_policy, ordering
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                RETURNING id
+                """,
+                name,
+                webhook_url,
+                webhook_type,
+                json.dumps(operations),
+                resource_type_name,
+                resource_type_version,
+                timeout_seconds,
+                failure_policy,
+                ordering,
+            )
+            logger.info(f"Created admission webhook {name} with ID {webhook_id}")
+            return webhook_id
+
+    async def get_admission_webhook(self, webhook_id: int) -> Optional[Dict[str, Any]]:
+        """Get an admission webhook by ID."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM admission_webhooks WHERE id = $1",
+                webhook_id,
+            )
+            if not row:
+                return None
+            return self._parse_webhook_row(row)
+
+    async def list_admission_webhooks(
+        self,
+        resource_type_name: Optional[str] = None,
+        resource_type_version: Optional[str] = None,
+        webhook_type: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """List admission webhooks with optional filters."""
+        async with self.pool.acquire() as conn:
+            query = "SELECT * FROM admission_webhooks WHERE 1=1"
+            params: List[Any] = []
+            param_count = 0
+
+            if resource_type_name is not None:
+                param_count += 1
+                query += f" AND resource_type_name = ${param_count}"
+                params.append(resource_type_name)
+
+            if resource_type_version is not None:
+                param_count += 1
+                query += f" AND resource_type_version = ${param_count}"
+                params.append(resource_type_version)
+
+            if webhook_type is not None:
+                param_count += 1
+                query += f" AND webhook_type = ${param_count}"
+                params.append(webhook_type)
+
+            query += " ORDER BY webhook_type, ordering"
+            rows = await conn.fetch(query, *params)
+            return [self._parse_webhook_row(row) for row in rows]
+
+    async def update_admission_webhook(
+        self,
+        webhook_id: int,
+        webhook_url: Optional[str] = None,
+        webhook_type: Optional[str] = None,
+        operations: Optional[List[str]] = None,
+        resource_type_name: Optional[str] = None,
+        resource_type_version: Optional[str] = None,
+        timeout_seconds: Optional[int] = None,
+        failure_policy: Optional[str] = None,
+        ordering: Optional[int] = None,
+    ) -> None:
+        """Update an admission webhook."""
+        async with self.pool.acquire() as conn:
+            updates = []
+            params: List[Any] = []
+            param_count = 0
+
+            if webhook_url is not None:
+                param_count += 1
+                updates.append(f"webhook_url = ${param_count}")
+                params.append(webhook_url)
+
+            if webhook_type is not None:
+                param_count += 1
+                updates.append(f"webhook_type = ${param_count}")
+                params.append(webhook_type)
+
+            if operations is not None:
+                param_count += 1
+                updates.append(f"operations = ${param_count}")
+                params.append(json.dumps(operations))
+
+            if resource_type_name is not None:
+                param_count += 1
+                updates.append(f"resource_type_name = ${param_count}")
+                params.append(resource_type_name)
+
+            if resource_type_version is not None:
+                param_count += 1
+                updates.append(f"resource_type_version = ${param_count}")
+                params.append(resource_type_version)
+
+            if timeout_seconds is not None:
+                param_count += 1
+                updates.append(f"timeout_seconds = ${param_count}")
+                params.append(timeout_seconds)
+
+            if failure_policy is not None:
+                param_count += 1
+                updates.append(f"failure_policy = ${param_count}")
+                params.append(failure_policy)
+
+            if ordering is not None:
+                param_count += 1
+                updates.append(f"ordering = ${param_count}")
+                params.append(ordering)
+
+            if not updates:
+                return
+
+            updates.append("updated_at = NOW()")
+            param_count += 1
+            params.append(webhook_id)
+
+            query = (
+                f"UPDATE admission_webhooks SET {', '.join(updates)} "
+                f"WHERE id = ${param_count}"
+            )
+            await conn.execute(query, *params)
+            logger.info(f"Updated admission webhook {webhook_id}")
+
+    async def delete_admission_webhook(self, webhook_id: int) -> bool:
+        """
+        Delete an admission webhook.
+
+        Returns:
+            True if deleted, False if not found.
+        """
+        async with self.pool.acquire() as conn:
+            result = await conn.fetchval(
+                "DELETE FROM admission_webhooks WHERE id = $1 RETURNING id",
+                webhook_id,
+            )
+            if result:
+                logger.info(f"Deleted admission webhook {webhook_id}")
+                return True
+            return False
+
+    async def get_matching_webhooks(
+        self,
+        resource_type_name: str,
+        resource_type_version: str,
+        operation: str,
+    ) -> List[Dict[str, Any]]:
+        """
+        Get webhooks matching a resource type and operation.
+
+        Returns webhooks that either target the specific resource type or are
+        global (NULL resource_type_name), and whose operations list includes
+        the given operation. Results are ordered: mutating first, then
+        validating, each sorted by ordering.
+
+        Args:
+            resource_type_name: The resource type name
+            resource_type_version: The resource type version
+            operation: The operation (CREATE, UPDATE, DELETE)
+
+        Returns:
+            List of matching webhook dicts.
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT * FROM admission_webhooks
+                WHERE (resource_type_name IS NULL OR resource_type_name = $1)
+                  AND (resource_type_version IS NULL OR resource_type_version = $2)
+                  AND operations @> $3::jsonb
+                ORDER BY
+                    CASE webhook_type
+                        WHEN 'mutating' THEN 0
+                        WHEN 'validating' THEN 1
+                    END,
+                    ordering
+                """,
+                resource_type_name,
+                resource_type_version,
+                json.dumps([operation]),
+            )
+            return [self._parse_webhook_row(row) for row in rows]
+
+    def _parse_webhook_row(self, row: asyncpg.Record) -> Dict[str, Any]:
+        """Parse an admission_webhooks row from the database."""
+        result = dict(row)
+        result["operations"] = (
+            json.loads(result["operations"])
+            if isinstance(result.get("operations"), str)
+            else result.get("operations", [])
+        )
+        return result

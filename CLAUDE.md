@@ -65,6 +65,9 @@ The system follows a delegated controller pattern inspired by Kubernetes:
 - **Declarative Infrastructure**: Define desired state; reconciler plugins ensure it matches reality
 - **Resource Types with Schema Validation**: Define resource types with OpenAPI v3 schemas (similar to Kubernetes CRDs)
 - **3rd Party Reconcilers**: Reconciliation logic is owned by separately installable pip packages, auto-discovered via Python entry points
+- **Finalizers**: Kubernetes-style deletion protection — resources cannot be hard-deleted until all finalizers are cleared
+- **Admission Webhooks**: HTTP callback-based validating and mutating webhooks, called before resource persistence
+- **Event Streaming**: Server-Sent Events (SSE) for real-time watch semantics on resource changes
 - **Extendable**: Input plugins, reconciler plugins, and action plugins can all be extended independently
 - **PostgreSQL Metadata**: Resource definitions, cached state, reconciliation history, and locks (equivalent of ETCD in Kubernetes)
 - **Automatic Reconciliation**: Continuous drift detection and correction via reconciler plugins
@@ -118,7 +121,6 @@ Action plugins are optional executors that reconciler plugins can use to perform
 
 - **GitHub Actions** (implemented) - Trigger GitHub Actions workflows and monitor completion
 - **GitLab Pipelines** (planned) - Trigger GitLab CI/CD pipelines
-- **Terraform** (planned) - Execute Terraform init/plan/apply
 - **HTTP API** (planned) - Call external APIs to perform actions
 
 ## Resource Types
@@ -411,7 +413,23 @@ curl http://localhost:8000/api/v1/resources/1/outputs
 curl -X DELETE http://localhost:8000/api/v1/resources/1
 ```
 
-This triggers the reconciler plugin's destroy logic. For resources using GitHub Actions, this cancels any running workflow.
+This soft-deletes the resource (sets `deleted_at` and `status='deleting'`). The controller then runs the action plugin's destroy logic, removes its finalizer, and hard-deletes the resource once all finalizers are cleared. If external finalizers remain, the resource stays in `deleting` state until they are removed.
+
+### Managing Finalizers
+
+Finalizers prevent premature deletion. The action plugin's finalizer is added automatically on resource creation and removed after successful destroy. External controllers can add their own finalizers:
+
+```bash
+# Add a finalizer
+curl -X PUT http://localhost:8000/api/v1/resources/1/finalizers \
+  -H "Content-Type: application/json" \
+  -d '{"add": ["external-controller"]}'
+
+# Remove a finalizer
+curl -X PUT http://localhost:8000/api/v1/resources/1/finalizers \
+  -H "Content-Type: application/json" \
+  -d '{"remove": ["external-controller"]}'
+```
 
 ### Manual Reconciliation Trigger
 
@@ -457,12 +475,16 @@ Update status ◀── Record history ◀─────── Report ◀──
 pending → reconciling → ready
                       ↓
                     failed → (exponential backoff) → reconciling
+
+Deletion:
+ready/failed → deleting → (destroy) → remove finalizer → hard delete (if no finalizers remain)
 ```
 
 - **Pending**: Resource created, waiting for first reconciliation
 - **Reconciling**: Reconciler plugin is currently executing
 - **Ready**: Successfully reconciled, matches desired state
 - **Failed**: Reconciliation failed, will retry with backoff
+- **Deleting**: Marked for deletion, waiting for destroy and finalizer removal
 
 ## Configuration
 
@@ -471,7 +493,8 @@ pending → reconciling → ready
 The system uses these PostgreSQL tables:
 
 - **resource_types**: Defines resource schemas (similar to CRDs) with OpenAPI v3 validation
-- **resources**: Stores desired state, status, and outputs (references a resource_type)
+- **resources**: Stores desired state, status, outputs, and finalizers (references a resource_type). The `finalizers` column is a JSONB array of strings that must be empty before a resource can be hard-deleted
+- **admission_webhooks**: Registered webhook endpoints for validating/mutating resources before persistence
 - **reconciliation_history**: Audit log of all reconciliation attempts
 - **locks**: Distributed locking (for future multi-controller support)
 
@@ -487,6 +510,151 @@ controller = OperatorController(
 ```
 
 ## Advanced Features
+
+### Finalizers
+
+Finalizers provide Kubernetes-style deletion protection. A resource cannot be hard-deleted from the database until its `finalizers` JSONB array is empty.
+
+**Lifecycle:**
+1. On resource creation, the action plugin name is automatically added as a finalizer (e.g. `["github_actions"]`)
+2. External controllers can add their own finalizers via the API
+3. On deletion (`DELETE /api/v1/resources/{id}`), the resource is soft-deleted (`deleted_at` set, `status='deleting'`)
+4. The controller runs the action plugin's `destroy()` method
+5. On successful destroy, the controller removes its own finalizer
+6. If no finalizers remain, the resource is hard-deleted from the database
+7. If external finalizers remain, the resource stays in `deleting` state until external controllers clear their finalizers
+
+**Database:** The `resources` table has a `finalizers JSONB NOT NULL DEFAULT '[]'` column. The `hard_delete_resource()` method includes a guard: `WHERE finalizers = '[]'::jsonb`.
+
+**API:**
+- `PUT /api/v1/resources/{id}/finalizers` — accepts `{"add": [...], "remove": [...]}` to modify finalizers
+- Resource responses include the `finalizers` field
+
+### Admission Webhooks
+
+Admission webhooks intercept resource mutations before they are persisted to the database, similar to Kubernetes admission controllers. They are implemented as external HTTP callbacks.
+
+**Webhook types:**
+- **Mutating**: Can modify the resource spec before persistence. Called first, in `ordering` order. Mutations are applied as JSON Patch operations (add, replace, remove).
+- **Validating**: Can accept or reject a resource mutation. Called after all mutating webhooks, in `ordering` order. The chain stops on first denial.
+
+**Database schema (`admission_webhooks` table):**
+
+| Column | Type | Description |
+|--------|------|-------------|
+| id | SERIAL PRIMARY KEY | Unique identifier |
+| name | VARCHAR UNIQUE | Webhook name |
+| resource_type_name | VARCHAR (nullable) | Target resource type (NULL = all types) |
+| resource_type_version | VARCHAR (nullable) | Target version (NULL = all versions) |
+| webhook_url | VARCHAR NOT NULL | HTTP endpoint to call |
+| webhook_type | VARCHAR NOT NULL | `validating` or `mutating` |
+| operations | JSONB NOT NULL | Array of operations to intercept: `["CREATE", "UPDATE", "DELETE"]` |
+| timeout_seconds | INTEGER DEFAULT 10 | HTTP timeout for the webhook call |
+| failure_policy | VARCHAR DEFAULT 'Fail' | `Fail` (reject on error) or `Ignore` (allow on error) |
+| ordering | INTEGER DEFAULT 0 | Execution order within webhook type (lower = first) |
+
+**Admission request (POST to webhook_url):**
+
+```json
+{
+  "operation": "CREATE",
+  "resource": {
+    "name": "production-pg",
+    "resource_type_name": "DatabaseCluster",
+    "resource_type_version": "v1",
+    "spec": { ... }
+  },
+  "old_resource": null
+}
+```
+
+For `UPDATE` operations, `old_resource` contains the pre-update state.
+
+**Admission response (from webhook):**
+
+```json
+{
+  "allowed": true,
+  "message": "Resource approved",
+  "patches": [
+    {"op": "add", "path": "/spec/backup_retention_days", "value": 7},
+    {"op": "replace", "path": "/spec/high_availability", "value": true}
+  ]
+}
+```
+
+- `allowed`: Whether the operation is permitted
+- `message`: Human-readable reason (shown to user on denial)
+- `patches`: JSON Patch operations (only for mutating webhooks)
+
+**Admission chain (`src/admission.py`):**
+
+The `AdmissionChain` class orchestrates webhook execution:
+1. Fetch matching webhooks from DB (filtered by resource type, version, and operation)
+2. Execute all mutating webhooks in `ordering` order, accumulating patches
+3. Execute all validating webhooks in `ordering` order, stopping on first denial
+4. Return the (potentially mutated) resource or raise `AdmissionError` on denial
+
+**Failure policy:**
+- `Fail`: If the webhook HTTP call fails (timeout, 5xx, network error), the operation is rejected
+- `Ignore`: If the webhook HTTP call fails, the operation proceeds as if the webhook allowed it
+
+**API endpoints:**
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/v1/admission-webhooks` | Register a webhook |
+| GET | `/api/v1/admission-webhooks` | List all webhooks |
+| GET | `/api/v1/admission-webhooks/{id}` | Get a webhook |
+| PUT | `/api/v1/admission-webhooks/{id}` | Update a webhook |
+| DELETE | `/api/v1/admission-webhooks/{id}` | Delete a webhook |
+
+**Integration points:** The admission chain is called in the HTTP API's `create_resource`, `update_resource`, and `delete_resource` handlers, after validation but before database persistence. A denied admission returns HTTP 403.
+
+### Event Streaming
+
+Event streaming provides real-time watch semantics via Server-Sent Events (SSE), similar to `kubectl get --watch` or the Kubernetes watch API.
+
+**Event types:**
+
+| Event | Emitted by | Trigger |
+|-------|-----------|---------|
+| `CREATED` | HTTP API | Resource created |
+| `MODIFIED` | HTTP API | Resource spec updated |
+| `DELETED` | HTTP API | Resource deletion requested |
+| `RECONCILED` | Controller | Successful reconciliation completed |
+
+**Event format (SSE):**
+
+```
+event: MODIFIED
+data: {"event_type": "MODIFIED", "resource_id": 1, "resource_name": "production-pg", "resource_type_name": "DatabaseCluster", "resource_type_version": "v1", "resource_data": {...}, "timestamp": "2024-01-15T10:35:00Z"}
+
+```
+
+**Architecture (`src/events.py`):**
+
+- `EventType` enum: CREATED, MODIFIED, DELETED, RECONCILED
+- `ResourceEvent` dataclass: Contains event_type, resource_id, resource_name, resource_type_name/version, full resource_data, and timestamp. Has a `to_sse()` method for SSE formatting.
+- `EventBus` class: In-memory pub/sub using `asyncio.Queue` per subscriber
+  - `publish(event)` — non-blocking put to all subscriber queues; drops events on full queues to prevent backpressure
+  - `subscribe(filter_fn)` — returns a subscriber ID and `EventSubscription` async iterator
+  - `unsubscribe(subscriber_id)` — removes subscriber and cleans up queue
+- `EventSubscription` class: Async iterator that yields events from the subscriber's queue, applying an optional filter function
+
+**API endpoints:**
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/v1/events` | SSE stream of all events. Optional `resource_type` query param to filter |
+| GET | `/api/v1/resources/{id}/events` | SSE stream for a single resource |
+
+Both endpoints use FastAPI's `StreamingResponse` with `text/event-stream` content type.
+
+**Publishing:**
+- The HTTP API publishes `CREATED`, `MODIFIED`, and `DELETED` events in the create/update/delete handlers
+- The controller publishes `RECONCILED` events after successful reconciliation in `_reconcile_resource()`
+- Both receive an `EventBus` instance wired via `main.py`
 
 ### Drift Detection
 
@@ -511,17 +679,19 @@ When `generation > observed_generation`, reconciliation is triggered.
 
 ## Comparison to Kubernetes
 
-| Kubernetes                       | Operator Controller                                          |
-|----------------------------------|--------------------------------------------------------------|
-| etcd                             | PostgreSQL                                                   |
-| CustomResourceDefinitions (CRDs) | Resource Types with OpenAPI v3 schemas                       |
-| Custom Resources                 | Resources (validated against resource type schema)           |
-| Controller Manager               | Main loop (controller.py) — event handling, caching, dispatch|
-| Controllers/Operators            | Reconciler plugins (3rd party pip packages)                  |
-| kubectl apply                    | POST /api/v1/resources                                       |
-| kubectl get                      | GET /api/v1/resources                                        |
-| Finalizers                       | Reconciler plugin destroy on deletion                        |
-| Status conditions                | status + status_message fields                               |
+| Kubernetes                       | Operator Controller                                             |
+|----------------------------------|-----------------------------------------------------------------|
+| etcd                             | PostgreSQL                                                      |
+| CustomResourceDefinitions (CRDs) | Resource Types with OpenAPI v3 schemas                          |
+| Custom Resources                 | Resources (validated against resource type schema)              |
+| Controller Manager               | Main loop (controller.py) — event handling, caching, dispatch   |
+| Controllers/Operators            | Reconciler plugins (3rd party pip packages)                     |
+| kubectl apply                    | POST /api/v1/resources                                          |
+| kubectl get                      | GET /api/v1/resources                                           |
+| kubectl get --watch              | GET /api/v1/events (SSE)                                        |
+| Finalizers                       | JSONB finalizers array on resources, cleared before hard-delete |
+| Admission Webhooks               | HTTP callback webhooks with mutating/validating support         |
+| Status conditions                | status + status_message fields                                  |
 
 ## Monitoring
 
@@ -581,6 +751,8 @@ pytest tests/
 │   ├── controller.py           # Main loop: event handling, caching, dispatch
 │   ├── db.py                   # PostgreSQL database manager
 │   ├── validation.py           # OpenAPI v3 schema validation
+│   ├── admission.py            # Admission webhook chain
+│   ├── events.py               # EventBus and SSE event streaming
 │   ├── plugins/
 │   │   ├── inputs/
 │   │   │   └── http/           # HTTP Input plugin
