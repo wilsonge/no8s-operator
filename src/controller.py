@@ -85,7 +85,7 @@ class Controller:
         config, with resource-specific values taking precedence.
 
         Args:
-            name: The name of the action plugin (e.g., 'terraform')
+            name: The name of the action plugin (e.g., 'github_actions')
             config: Optional resource-specific plugin configuration to merge
 
         Returns:

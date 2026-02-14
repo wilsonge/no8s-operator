@@ -836,7 +836,7 @@ class HTTPInputPlugin(InputPlugin):
                 if self._on_resource_event:
                     spec = ResourceSpec(
                         name=updated["name"],
-                        action_plugin=updated.get("action_plugin", "terraform"),
+                        action_plugin=updated.get("action_plugin", "github_actions"),
                         spec=updated.get("spec", {}),
                         plugin_config=updated.get("plugin_config"),
                     )
@@ -890,7 +890,7 @@ class HTTPInputPlugin(InputPlugin):
                 if self._on_resource_event:
                     spec = ResourceSpec(
                         name=resource["name"],
-                        action_plugin=resource.get("action_plugin", "terraform"),
+                        action_plugin=resource.get("action_plugin", "github_actions"),
                         spec=resource.get("spec", {}),
                     )
                     await self._on_resource_event("deleted", spec)

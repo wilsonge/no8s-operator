@@ -13,7 +13,7 @@ no8s-operator brings the power of Kubernetes-style declarative infrastructure ma
 
 - **Declarative Infrastructure**: Define desired state; the controller ensures it matches reality
 - **Resource Types with Schema Validation**: Define resource types with OpenAPI v3 schemas (similar to Kubernetes CRDs)
-- **Plugin Architecture**: Extensible inputs (HTTP API, polling, queues) and actions (GitHub Actions, GitLab, Terraform)
+- **Plugin Architecture**: Extensible inputs (HTTP API, polling, queues) and actions (GitHub Actions, GitLab, HTTP)
 - **Automatic Reconciliation**: Continuous drift detection and correction
 - **Audit History**: Complete history of all reconciliation attempts
 

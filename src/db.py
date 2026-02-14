@@ -113,7 +113,7 @@ class DatabaseManager:
         Create a new resource type.
 
         Args:
-            name: Resource type name (e.g., 'TerraformModule')
+            name: Resource type name (e.g., 'PostgresCluster')
             version: Version string (e.g., 'v1', 'v1beta1')
             schema: OpenAPI v3 JSON Schema for validating specs
             description: Optional description
@@ -312,7 +312,7 @@ class DatabaseManager:
             name: Resource name
             resource_type_name: Name of the resource type
             resource_type_version: Version of the resource type
-            action_plugin: Which action plugin to use (e.g., 'terraform')
+            action_plugin: Which action plugin to use (e.g., 'github_actions')
             spec: Resource specification (plugin-specific)
             plugin_config: Plugin configuration (e.g., backend config)
             metadata: Additional metadata
