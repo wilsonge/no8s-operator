@@ -1,11 +1,9 @@
 """
 Action Plugin Base - Abstract interface for infrastructure actions.
 
-Action plugins implement the actual infrastructure changes:
-- Terraform: runs terraform init/plan/apply
-- Ansible: runs ansible-playbook
-- Pulumi: runs pulumi up
-- Shell: runs shell scripts
+Action plugins are optional executors that reconciler plugins can use to
+apply changes. The default shipped plugin is GitHub Actions, which triggers
+and monitors GitHub Actions workflow runs.
 """
 
 from abc import ABC, abstractmethod
@@ -26,7 +24,7 @@ class ActionPlugin(ABC):
     @property
     @abstractmethod
     def name(self) -> str:
-        """Unique identifier for this plugin (e.g., 'terraform', 'ansible')."""
+        """Unique identifier for this plugin (e.g., 'github_actions')."""
         pass
 
     @property
@@ -71,7 +69,7 @@ class ActionPlugin(ABC):
 
         Returns:
             A workspace handle that will be passed to other methods.
-            The type is plugin-specific (e.g., Path for Terraform).
+            The type is plugin-specific.
         """
         pass
 

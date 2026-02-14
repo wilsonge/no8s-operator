@@ -66,7 +66,7 @@ def validate_json_size(
 class ResourceTypeCreate(BaseModel):
     """Request model for creating a resource type."""
 
-    name: str = Field(..., description="Resource type name", example="TerraformModule")
+    name: str = Field(..., description="Resource type name", example="PostgresCluster")
     version: str = Field(..., description="Version string", example="v1")
     schema: Dict[str, Any] = Field(..., description="OpenAPI v3 JSON Schema")
     description: Optional[str] = Field(None, description="Description of resource type")
@@ -124,7 +124,7 @@ class ResourceCreate(BaseModel):
 
     name: str = Field(..., description="Resource name", example="my-vpc")
     resource_type_name: str = Field(
-        ..., description="Resource type name", example="TerraformModule"
+        ..., description="Resource type name", example="PostgresCluster"
     )
     resource_type_version: str = Field(
         ..., description="Resource type version", example="v1"
