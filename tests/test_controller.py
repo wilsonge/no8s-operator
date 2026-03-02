@@ -648,3 +648,142 @@ class TestControllerAsync:
 
         # Should be limited by semaphore
         assert max_concurrent <= controller.max_concurrent_reconciles
+
+
+class TestControllerConditions:
+    """Tests that the controller sets standard conditions at each lifecycle step."""
+
+    @pytest.fixture
+    def mock_db(self):
+        db = AsyncMock()
+        db.update_resource_status = AsyncMock()
+        db.set_condition = AsyncMock()
+        db.record_reconciliation = AsyncMock()
+        db.update_resource_outputs = AsyncMock()
+        db.remove_finalizer = AsyncMock()
+        db.get_finalizers = AsyncMock(return_value=[])
+        db.hard_delete_resource = AsyncMock(return_value=True)
+        db.get_resource = AsyncMock(return_value=None)
+        return db
+
+    @pytest.fixture
+    def mock_registry(self):
+        registry = MagicMock()
+        registry.get_action_plugin = AsyncMock()
+        return registry
+
+    @pytest.fixture
+    def controller(self, mock_db, mock_registry):
+        config = ControllerConfig(reconcile_interval=1, max_concurrent_reconciles=2)
+        return Controller(db_manager=mock_db, registry=mock_registry, config=config)
+
+    def _make_resource(self, status="pending"):
+        return {
+            "id": 1,
+            "name": "test-resource",
+            "action_plugin": "github_actions",
+            "generation": 2,
+            "observed_generation": 1,
+            "spec": {},
+            "spec_hash": "abc123",
+            "plugin_config": {},
+            "status": status,
+            "last_reconcile_time": None,
+        }
+
+    async def test_success_sets_ready_true(self, controller, mock_db, mock_registry):
+        """On successful reconcile, Ready=True and Reconciling=False are set."""
+        mock_plugin = AsyncMock()
+        mock_plugin.prepare = AsyncMock(return_value="/workspace")
+        mock_plugin.plan = AsyncMock(
+            return_value=ActionResult(success=True, has_changes=True)
+        )
+        mock_plugin.apply = AsyncMock(
+            return_value=ActionResult(
+                success=True, phase=ActionPhase.COMPLETED, resources_updated=1
+            )
+        )
+        mock_plugin.cleanup = AsyncMock()
+        mock_registry.get_action_plugin.return_value = mock_plugin
+
+        await controller._reconcile_resource(self._make_resource())
+
+        condition_calls = [
+            (call.args[1], call.args[2])  # (condition_type, status)
+            for call in mock_db.set_condition.call_args_list
+        ]
+        assert ("Ready", "True") in condition_calls
+        assert ("Reconciling", "False") in condition_calls
+        assert ("Degraded", "False") in condition_calls
+
+    async def test_failure_sets_ready_false_and_degraded(
+        self, controller, mock_db, mock_registry
+    ):
+        """On failed reconcile, Ready=False and Degraded=True are set."""
+        mock_plugin = AsyncMock()
+        mock_plugin.prepare = AsyncMock(return_value="/workspace")
+        mock_plugin.plan = AsyncMock(
+            return_value=ActionResult(
+                success=False, phase=ActionPhase.FAILED, error_message="Plan failed"
+            )
+        )
+        mock_plugin.cleanup = AsyncMock()
+        mock_registry.get_action_plugin.return_value = mock_plugin
+
+        await controller._reconcile_resource(self._make_resource())
+
+        condition_calls = [
+            (call.args[1], call.args[2])
+            for call in mock_db.set_condition.call_args_list
+        ]
+        assert ("Ready", "False") in condition_calls
+        assert ("Degraded", "True") in condition_calls
+        assert ("Reconciling", "False") in condition_calls
+
+    async def test_reconcile_start_sets_reconciling_true(
+        self, controller, mock_db, mock_registry
+    ):
+        """At reconcile start, Reconciling=True and Ready=Unknown are set."""
+        mock_plugin = AsyncMock()
+        mock_plugin.prepare = AsyncMock(return_value="/workspace")
+        mock_plugin.plan = AsyncMock(
+            return_value=ActionResult(success=True, has_changes=False)
+        )
+        mock_plugin.cleanup = AsyncMock()
+        mock_registry.get_action_plugin.return_value = mock_plugin
+
+        await controller._reconcile_resource(self._make_resource())
+
+        # The first set_condition calls (before execution) should set Reconciling=True
+        all_calls = [
+            (call.args[1], call.args[2])
+            for call in mock_db.set_condition.call_args_list
+        ]
+        assert ("Reconciling", "True") in all_calls
+        assert ("Ready", "Unknown") in all_calls
+
+    async def test_deletion_sets_ready_unknown_deleting(
+        self, controller, mock_db, mock_registry
+    ):
+        """On deletion success, Ready=Unknown/Deleting and Reconciling=False/Deleting."""
+        mock_plugin = AsyncMock()
+        mock_plugin.prepare = AsyncMock(return_value="/workspace")
+        mock_plugin.plan = AsyncMock(
+            return_value=ActionResult(success=True, has_changes=True)
+        )
+        mock_plugin.destroy = AsyncMock(
+            return_value=ActionResult(
+                success=True, phase=ActionPhase.COMPLETED, resources_deleted=1
+            )
+        )
+        mock_plugin.cleanup = AsyncMock()
+        mock_registry.get_action_plugin.return_value = mock_plugin
+
+        await controller._reconcile_resource(self._make_resource(status="deleting"))
+
+        condition_calls = [
+            (call.args[1], call.args[2], call.args[3])  # type, status, reason
+            for call in mock_db.set_condition.call_args_list
+        ]
+        assert ("Reconciling", "False", "Deleting") in condition_calls
+        assert ("Ready", "Unknown", "Deleting") in condition_calls

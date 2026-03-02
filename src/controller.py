@@ -244,6 +244,7 @@ class Controller:
             resource_id = resource["id"]
             resource_name = resource["name"]
             action_plugin_name = resource["action_plugin"]
+            generation = resource.get("generation", 0)
             start_time = time.monotonic()
             trigger_reason = self._determine_trigger_reason(resource)
             drift_detected = False
@@ -254,6 +255,22 @@ class Controller:
                     resource_id,
                     ResourceStatus.RECONCILING,
                     message="Starting reconciliation",
+                )
+                await self.db.set_condition(
+                    resource_id,
+                    "Reconciling",
+                    "True",
+                    "ReconcileStarted",
+                    "Reconciliation has started",
+                    generation,
+                )
+                await self.db.set_condition(
+                    resource_id,
+                    "Ready",
+                    "Unknown",
+                    "ReconcileStarted",
+                    "Reconciliation in progress",
+                    generation,
                 )
 
                 # Get the appropriate action plugin
@@ -290,6 +307,22 @@ class Controller:
                     if resource.get("status") == ResourceStatus.DELETING.value:
                         # Destroy succeeded — remove our finalizer and
                         # hard-delete if all finalizers are cleared
+                        await self.db.set_condition(
+                            resource_id,
+                            "Reconciling",
+                            "False",
+                            "Deleting",
+                            "Resource is being deleted",
+                            generation,
+                        )
+                        await self.db.set_condition(
+                            resource_id,
+                            "Ready",
+                            "Unknown",
+                            "Deleting",
+                            "Resource is being deleted",
+                            generation,
+                        )
                         await self.db.remove_finalizer(resource_id, action_plugin_name)
                         remaining = await self.db.get_finalizers(resource_id)
                         if not remaining:
@@ -309,6 +342,30 @@ class Controller:
                             message="Reconciliation successful",
                             observed_generation=ctx.generation,
                         )
+                        await self.db.set_condition(
+                            resource_id,
+                            "Ready",
+                            "True",
+                            "ReconcileSuccess",
+                            "Resource reconciled successfully",
+                            generation,
+                        )
+                        await self.db.set_condition(
+                            resource_id,
+                            "Reconciling",
+                            "False",
+                            "ReconcileComplete",
+                            "Reconciliation completed",
+                            generation,
+                        )
+                        await self.db.set_condition(
+                            resource_id,
+                            "Degraded",
+                            "False",
+                            "NoErrors",
+                            "",
+                            generation,
+                        )
                         logger.info(f"Successfully reconciled {resource_name}")
 
                         # Publish RECONCILED event
@@ -320,10 +377,35 @@ class Controller:
                                 )
                                 await self._event_bus.publish(event)
                 else:
+                    error_msg = result.error_message or "Reconciliation failed"
                     await self.db.update_resource_status(
                         resource_id,
                         ResourceStatus.FAILED,
-                        message=result.error_message or "Reconciliation failed",
+                        message=error_msg,
+                    )
+                    await self.db.set_condition(
+                        resource_id,
+                        "Ready",
+                        "False",
+                        "ReconcileFailed",
+                        error_msg,
+                        generation,
+                    )
+                    await self.db.set_condition(
+                        resource_id,
+                        "Reconciling",
+                        "False",
+                        "ReconcileFailed",
+                        "",
+                        generation,
+                    )
+                    await self.db.set_condition(
+                        resource_id,
+                        "Degraded",
+                        "True",
+                        "ReconcileFailed",
+                        error_msg,
+                        generation,
                     )
                     logger.error(
                         f"Failed to reconcile {resource_name}: "
@@ -349,10 +431,35 @@ class Controller:
 
             except Exception as e:
                 logger.error(f"Error reconciling {resource_name}: {e}", exc_info=True)
+                error_msg = f"Reconciliation error: {str(e)}"
                 await self.db.update_resource_status(
                     resource_id,
                     ResourceStatus.FAILED,
-                    message=f"Reconciliation error: {str(e)}",
+                    message=error_msg,
+                )
+                await self.db.set_condition(
+                    resource_id,
+                    "Ready",
+                    "False",
+                    "ReconcileFailed",
+                    error_msg,
+                    generation,
+                )
+                await self.db.set_condition(
+                    resource_id,
+                    "Reconciling",
+                    "False",
+                    "ReconcileFailed",
+                    "",
+                    generation,
+                )
+                await self.db.set_condition(
+                    resource_id,
+                    "Degraded",
+                    "True",
+                    "ReconcileFailed",
+                    error_msg,
+                    generation,
                 )
 
     async def _execute_reconciliation(

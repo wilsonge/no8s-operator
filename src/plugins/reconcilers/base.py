@@ -90,6 +90,35 @@ class ReconcilerContext:
             observed_generation=observed_generation,
         )
 
+    async def set_condition(
+        self,
+        resource_id: int,
+        condition_type: str,
+        status: str,
+        reason: str,
+        message: str = "",
+        observed_generation: Optional[int] = None,
+    ) -> None:
+        """
+        Set a named condition on a resource.
+
+        Args:
+            resource_id: The resource ID.
+            condition_type: Condition type (e.g. 'Ready', 'DatabaseAvailable').
+            status: "True", "False", or "Unknown".
+            reason: Short CamelCase reason string.
+            message: Human-readable detail message.
+            observed_generation: Generation when this condition was set.
+        """
+        await self.db.set_condition(
+            resource_id=resource_id,
+            condition_type=condition_type,
+            status=status,
+            reason=reason,
+            message=message,
+            observed_generation=observed_generation or 0,
+        )
+
     async def get_action_plugin(self, name: str) -> ActionPlugin:
         """
         Get an initialized action plugin by name.

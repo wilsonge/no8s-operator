@@ -62,6 +62,7 @@ The system follows a delegated controller pattern inspired by Kubernetes:
 - **Resource Types with Schema Validation**: OpenAPI v3 schemas (similar to Kubernetes CRDs)
 - **3rd Party Reconcilers**: Auto-discovered via Python entry points
 - **Finalizers**: Kubernetes-style deletion protection — resources cannot be hard-deleted until all finalizers are cleared
+- **Status Conditions**: Named conditions (`Ready`, `Reconciling`, `Degraded`) set automatically by the controller; reconciler plugins add domain-specific conditions via `ctx.set_condition()`
 - **Admission Webhooks**: HTTP callback-based validating and mutating webhooks before persistence
 - **Event Streaming**: Server-Sent Events (SSE) for real-time watch semantics
 - **PostgreSQL Metadata**: Resource definitions, state, history, and locks (equivalent of etcd)
@@ -275,7 +276,7 @@ ready/failed → deleting → (destroy) → remove finalizer → hard delete (if
 PostgreSQL tables:
 
 - **resource_types**: Resource schemas with OpenAPI v3 validation
-- **resources**: Desired state, status, outputs, finalizers (`JSONB []`, must be empty for hard-delete)
+- **resources**: Desired state, status, outputs, finalizers (`JSONB []`, must be empty for hard-delete), conditions (`JSONB []`)
 - **admission_webhooks**: Webhook endpoints for validating/mutating before persistence
 - **reconciliation_history**: Audit log of reconciliation attempts
 - **locks**: Distributed locking (for future multi-controller support)
@@ -349,6 +350,30 @@ Real-time watch semantics via SSE, similar to `kubectl get --watch`.
 
 Both use FastAPI's `StreamingResponse` with `text/event-stream` content type.
 
+### Status Conditions
+
+Kubernetes-style named conditions stored as a `conditions` JSONB array on each resource. Each condition has:
+
+- `type` — unique name (e.g. `"Ready"`, `"Reconciling"`, `"Degraded"`, or custom like `"ReplicationHealthy"`)
+- `status` — `"True"`, `"False"`, or `"Unknown"`
+- `reason` — short CamelCase reason string
+- `message` — human-readable detail
+- `lastTransitionTime` — updated only when `status` changes (not on every reconcile)
+- `observedGeneration` — generation when the condition was set
+
+**Standard conditions set by the controller** (`controller.py`):
+
+| Event | `Ready` | `Reconciling` | `Degraded` |
+|-------|---------|---------------|------------|
+| Start | `Unknown` / `ReconcileStarted` | `True` / `ReconcileStarted` | — |
+| Success | `True` / `ReconcileSuccess` | `False` / `ReconcileComplete` | `False` / `NoErrors` |
+| Failure | `False` / `ReconcileFailed` | `False` / `ReconcileFailed` | `True` / `ReconcileFailed` |
+| Deleting | `Unknown` / `Deleting` | `False` / `Deleting` | — |
+
+**Custom conditions from reconciler plugins** — call `ctx.set_condition()` in `ReconcilerContext` to add domain-specific conditions alongside the standard ones.
+
+**Implementation (`src/db.py`):** `DatabaseManager.set_condition()` fetches the current `conditions` column, upserts the condition by `type`, preserves `lastTransitionTime` if `status` is unchanged, and writes back. Conditions are included in all resource GET responses via `_parse_resource_row()`.
+
 ### Drift Detection
 
 Re-reconciliation every 5 minutes for `ready` resources. The reconciler determines if drift occurred and reconciles automatically.
@@ -378,7 +403,8 @@ Reconciliation triggers when `generation > observed_generation`.
 | kubectl get --watch              | GET /api/v1/events (SSE)                                        |
 | Finalizers                       | JSONB finalizers array, cleared before hard-delete              |
 | Admission Webhooks               | HTTP callback webhooks with mutating/validating support         |
-| Status conditions                | status + status_message fields                                  |
+| Phase (`status.phase`)           | `status` enum field (pending/reconciling/ready/failed/deleting) |
+| `metav1.Condition` / `meta.SetStatusCondition()` | `conditions` JSONB array + `db.set_condition()` / `ctx.set_condition()` |
 
 ## Monitoring
 

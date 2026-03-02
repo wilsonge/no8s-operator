@@ -9,6 +9,7 @@ This guide walks through building a no8s reconciler plugin. If you've written a 
 | Controller with `Reconcile()`    | `ReconcilerPlugin` subclass                                 |
 | Informer / watch cache           | `ReconcilerContext.get_resources_needing_reconciliation()`  |
 | `client-go` status update        | `ReconcilerContext.update_status()`                         |
+| Status conditions                | `ReconcilerContext.set_condition()`                         |
 | Finalizers on the object         | `ReconcilerContext.get_finalizers()` / `remove_finalizer()` |
 | `ctrl.Result{RequeueAfter: ...}` | `ReconcileResult(requeue_after=seconds)`                    |
 | Entry in `manager.Register()`    | Python entry point in `no8s.reconcilers` group              |
@@ -132,7 +133,17 @@ class DnsRecordReconciler(ReconcilerPlugin):
             # Example: call your DNS provider
             # await self.dns_client.upsert_record(domain, record_type, value)
 
-            # Mark as ready (like setting Status.Conditions to Ready=True)
+            # Set a domain-specific condition for fine-grained observability
+            await ctx.set_condition(
+                resource_id,
+                condition_type="DnsRecordSynced",
+                status="True",
+                reason="RecordUpserted",
+                message=f"{record_type} record for {domain} synced",
+                observed_generation=resource["generation"],
+            )
+
+            # Mark as ready (the operator also sets Ready=True automatically)
             await ctx.update_status(
                 resource_id,
                 "ready",
@@ -143,6 +154,14 @@ class DnsRecordReconciler(ReconcilerPlugin):
             return ReconcileResult(success=True, message="Synced")
 
         except Exception as e:
+            # Set a domain-specific condition to capture the reason for failure
+            await ctx.set_condition(
+                resource_id,
+                condition_type="DnsRecordSynced",
+                status="False",
+                reason="ProviderError",
+                message=str(e),
+            )
             # Mark as failed — the operator's requeue loop will retry with backoff
             # (like returning ctrl.Result{}, err in Kubernetes)
             await ctx.update_status(
@@ -277,6 +296,7 @@ The `ReconcilerContext` is your interface back into the operator — similar to 
 |---|---|---|
 | `get_resources_needing_reconciliation(resource_type_names, limit)` | Informer work queue | Fetch resources where `generation > observed_generation`, status is `pending`/`failed`/`deleting`, or the drift detection window has elapsed |
 | `update_status(resource_id, status, message, observed_generation)` | `Status().Update()` | Set `status` to `pending`, `reconciling`, `ready`, `failed`, or `deleting`. Set `observed_generation` on success to acknowledge the spec |
+| `set_condition(resource_id, condition_type, status, reason, message, observed_generation)` | `meta.SetStatusCondition()` | Set a named condition on the resource. `status` is `"True"`, `"False"`, or `"Unknown"`. `lastTransitionTime` is only updated when `status` changes |
 | `record_reconciliation(resource_id, result, ...)` | Event recorder | Write an entry to the reconciliation history audit log |
 | `get_action_plugin(name)` | N/A (no8s-specific) | Get an action plugin instance to delegate execution (e.g. trigger a GitHub Actions workflow) |
 | `remove_finalizer(resource_id, finalizer)` | Patch to remove finalizer string | Remove a finalizer from the resource's JSONB array |
@@ -297,7 +317,9 @@ class ReconcileResult:
 
 ## Resource Lifecycle
 
-The status flow mirrors Kubernetes conditions:
+Resources move through a phase field (`status`) plus a set of named conditions.
+
+### Phase
 
 ```
 pending  -->  reconciling  -->  ready
@@ -310,6 +332,66 @@ ready/failed  -->  deleting  -->  (destroy + remove finalizers)  -->  hard delet
 ```
 
 Your reconciler is responsible for transitioning resources through `reconciling` -> `ready`/`failed`. The operator handles `pending` (on creation) and `deleting` (on `DELETE` API call). The operator's requeue loop retries `failed` resources with exponential backoff automatically.
+
+### Status Conditions
+
+Alongside the phase, resources carry an array of named conditions — each with `type`, `status` (`"True"`/`"False"`/`"Unknown"`), `reason` (CamelCase), `message`, `lastTransitionTime`, and `observedGeneration`. This is equivalent to `metav1.Condition` in Kubernetes.
+
+The operator sets three standard conditions automatically at each lifecycle transition:
+
+| Condition     | Reconciling start   | Success | Failure | Deleting    |
+|---------------|---------------------|---------|---------|-------------|
+| `Ready`       | `Unknown`           | `True`  | `False` | `Unknown`   |
+| `Reconciling` | `True`              | `False` | `False` | `False`     |
+| `Degraded`    | (unchanged)         | `False` | `True`  | (unchanged) |
+
+Your reconciler can add domain-specific conditions on top of these using `ctx.set_condition()`. A DNS reconciler might add `DnsRecordSynced`; a database reconciler might add `ReplicationHealthy` or `SchemaApplied`.
+
+`lastTransitionTime` is only updated when the condition's `status` value changes — not on every reconciliation. This matches Kubernetes semantics and lets consumers detect actual state changes.
+
+Conditions appear in every resource GET response:
+
+```json
+{
+  "id": 1,
+  "name": "api-record",
+  "status": "ready",
+  "conditions": [
+    {
+      "type": "Ready",
+      "status": "True",
+      "reason": "ReconcileSuccess",
+      "message": "Resource reconciled successfully",
+      "lastTransitionTime": "2024-06-01T12:00:00+00:00",
+      "observedGeneration": 3
+    },
+    {
+      "type": "Reconciling",
+      "status": "False",
+      "reason": "ReconcileComplete",
+      "message": "Reconciliation completed",
+      "lastTransitionTime": "2024-06-01T12:00:00+00:00",
+      "observedGeneration": 3
+    },
+    {
+      "type": "Degraded",
+      "status": "False",
+      "reason": "NoErrors",
+      "message": "",
+      "lastTransitionTime": "2024-06-01T12:00:00+00:00",
+      "observedGeneration": 3
+    },
+    {
+      "type": "DnsRecordSynced",
+      "status": "True",
+      "reason": "RecordUpserted",
+      "message": "A record for api.example.com synced",
+      "lastTransitionTime": "2024-06-01T12:00:00+00:00",
+      "observedGeneration": 3
+    }
+  ]
+}
+```
 
 ## Using Action Plugins
 

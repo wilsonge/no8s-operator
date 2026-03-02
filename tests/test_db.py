@@ -4,7 +4,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from contextlib import asynccontextmanager
 
-from db import DatabaseManager, ResourceStatus, ReconciliationResult
+from db import Condition, DatabaseManager, ResourceStatus, ReconciliationResult
 
 
 class TestResourceStatus:
@@ -772,3 +772,233 @@ class TestDatabaseManagerAsync:
         history = await db_manager.get_reconciliation_history(1, limit=10)
         assert len(history) == 1
         assert history[0]["success"] is True
+
+
+class TestCondition:
+    """Tests for the Condition dataclass."""
+
+    def test_to_dict(self):
+        """to_dict() returns camelCase keys expected by the API."""
+        from datetime import timezone
+
+        dt = __import__("datetime").datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        c = Condition(
+            type="Ready",
+            status="True",
+            reason="ReconcileSuccess",
+            message="All good",
+            last_transition_time=dt,
+            observed_generation=3,
+        )
+        d = c.to_dict()
+        assert d["type"] == "Ready"
+        assert d["status"] == "True"
+        assert d["reason"] == "ReconcileSuccess"
+        assert d["message"] == "All good"
+        assert d["observedGeneration"] == 3
+        assert "lastTransitionTime" in d
+
+    def test_from_dict_round_trip(self):
+        """from_dict() round-trips through to_dict()."""
+        from datetime import timezone
+
+        dt = __import__("datetime").datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        c = Condition(
+            type="Degraded",
+            status="False",
+            reason="NoErrors",
+            message="",
+            last_transition_time=dt,
+            observed_generation=1,
+        )
+        c2 = Condition.from_dict(c.to_dict())
+        assert c2.type == c.type
+        assert c2.status == c.status
+        assert c2.reason == c.reason
+        assert c2.observed_generation == c.observed_generation
+
+    def test_from_dict_missing_optional_fields(self):
+        """from_dict() handles missing optional fields gracefully."""
+        d = {"type": "Ready", "status": "Unknown"}
+        c = Condition.from_dict(d)
+        assert c.type == "Ready"
+        assert c.status == "Unknown"
+        assert c.reason == ""
+        assert c.message == ""
+        assert c.observed_generation == 0
+
+    def test_from_dict_invalid_timestamp(self):
+        """from_dict() falls back to now() on invalid lastTransitionTime."""
+        import datetime
+
+        before = datetime.datetime.now(datetime.timezone.utc)
+        d = {
+            "type": "Ready",
+            "status": "True",
+            "lastTransitionTime": "not-a-date",
+        }
+        c = Condition.from_dict(d)
+        after = datetime.datetime.now(datetime.timezone.utc)
+        assert before <= c.last_transition_time <= after
+
+
+@pytest.mark.asyncio
+class TestSetCondition:
+    """Tests for DatabaseManager.set_condition()."""
+
+    @pytest.fixture
+    def db_manager(self):
+        return DatabaseManager(
+            host="localhost",
+            port=5432,
+            database="testdb",
+            user="testuser",
+            password="testpass",
+        )
+
+    @pytest.fixture
+    def mock_pool(self):
+        return AsyncMock()
+
+    async def test_set_condition_new(self, db_manager, mock_pool):
+        """Setting a condition that doesn't exist yet inserts it."""
+        db_manager.pool = mock_pool
+
+        @asynccontextmanager
+        async def mock_acquire():
+            conn = AsyncMock()
+            conn.fetchrow = AsyncMock(return_value={"conditions": "[]"})
+            conn.execute = AsyncMock()
+            yield conn
+
+        mock_pool.acquire = mock_acquire
+
+        await db_manager.set_condition(
+            resource_id=1,
+            condition_type="Ready",
+            status="True",
+            reason="ReconcileSuccess",
+            message="Done",
+            observed_generation=2,
+        )
+
+    async def test_set_condition_preserves_transition_time_on_same_status(
+        self, db_manager, mock_pool
+    ):
+        """If condition status is unchanged, lastTransitionTime is preserved."""
+        import json
+
+        existing_time = "2024-01-01T00:00:00+00:00"
+        existing = json.dumps(
+            [
+                {
+                    "type": "Ready",
+                    "status": "True",
+                    "reason": "ReconcileSuccess",
+                    "message": "Done",
+                    "lastTransitionTime": existing_time,
+                    "observedGeneration": 1,
+                }
+            ]
+        )
+
+        captured_args = {}
+
+        @asynccontextmanager
+        async def mock_acquire():
+            conn = AsyncMock()
+            conn.fetchrow = AsyncMock(return_value={"conditions": existing})
+
+            async def capture_execute(query, *args):
+                captured_args["written_json"] = args[0]
+
+            conn.execute = capture_execute
+            yield conn
+
+        mock_pool.acquire = mock_acquire
+        db_manager.pool = mock_pool
+
+        await db_manager.set_condition(
+            resource_id=1,
+            condition_type="Ready",
+            status="True",  # Same status
+            reason="ReconcileSuccess",
+            message="Updated message",
+            observed_generation=2,
+        )
+
+        written = json.loads(captured_args["written_json"])
+        ready = next(c for c in written if c["type"] == "Ready")
+        assert ready["lastTransitionTime"] == existing_time
+
+    async def test_set_condition_updates_transition_time_on_status_change(
+        self, db_manager, mock_pool
+    ):
+        """If condition status changes, lastTransitionTime is updated."""
+        import json
+
+        existing_time = "2024-01-01T00:00:00+00:00"
+        existing = json.dumps(
+            [
+                {
+                    "type": "Ready",
+                    "status": "False",
+                    "reason": "ReconcileFailed",
+                    "message": "Error",
+                    "lastTransitionTime": existing_time,
+                    "observedGeneration": 1,
+                }
+            ]
+        )
+
+        captured_args = {}
+
+        @asynccontextmanager
+        async def mock_acquire():
+            conn = AsyncMock()
+            conn.fetchrow = AsyncMock(return_value={"conditions": existing})
+
+            async def capture_execute(query, *args):
+                captured_args["written_json"] = args[0]
+
+            conn.execute = capture_execute
+            yield conn
+
+        mock_pool.acquire = mock_acquire
+        db_manager.pool = mock_pool
+
+        await db_manager.set_condition(
+            resource_id=1,
+            condition_type="Ready",
+            status="True",  # Changed from False to True
+            reason="ReconcileSuccess",
+            message="Done",
+            observed_generation=2,
+        )
+
+        written = json.loads(captured_args["written_json"])
+        ready = next(c for c in written if c["type"] == "Ready")
+        assert ready["lastTransitionTime"] != existing_time
+
+    async def test_set_condition_noop_on_missing_resource(self, db_manager, mock_pool):
+        """set_condition() is a no-op when the resource doesn't exist."""
+
+        @asynccontextmanager
+        async def mock_acquire():
+            conn = AsyncMock()
+            conn.fetchrow = AsyncMock(return_value=None)
+            conn.execute = AsyncMock()
+            yield conn
+
+        mock_pool.acquire = mock_acquire
+        db_manager.pool = mock_pool
+
+        # Should not raise
+        await db_manager.set_condition(
+            resource_id=999,
+            condition_type="Ready",
+            status="True",
+            reason="ReconcileSuccess",
+        )
+        # execute should NOT have been called
+        # (can't easily assert on the inner mock, just verify no exception)

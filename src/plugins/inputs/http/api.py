@@ -189,6 +189,19 @@ class ResourceUpdate(BaseModel):
         return validate_json_size(v, "plugin_config")
 
 
+class ConditionResponse(BaseModel):
+    """A single Kubernetes-style status condition."""
+
+    type: str
+    status: str
+    reason: str
+    message: str
+    last_transition_time: datetime = Field(alias="lastTransitionTime")
+    observed_generation: int = Field(default=0, alias="observedGeneration")
+
+    model_config = {"populate_by_name": True}
+
+
 class ResourceResponse(BaseModel):
     """Response model for a resource."""
 
@@ -202,6 +215,7 @@ class ResourceResponse(BaseModel):
     generation: int
     observed_generation: int
     finalizers: List[str] = []
+    conditions: List[ConditionResponse] = []
     created_at: datetime
     updated_at: datetime
     last_reconcile_time: Optional[datetime] = None

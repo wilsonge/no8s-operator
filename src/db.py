@@ -8,7 +8,8 @@ import asyncpg
 import hashlib
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
@@ -40,6 +41,46 @@ class ReconciliationResult:
     resources_updated: int = 0
     resources_deleted: int = 0
     has_changes: bool = False
+
+
+@dataclass
+class Condition:
+    """A Kubernetes-style status condition on a resource."""
+
+    type: str
+    status: str  # "True" | "False" | "Unknown"
+    reason: str
+    message: str
+    last_transition_time: datetime = field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+    observed_generation: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "type": self.type,
+            "status": self.status,
+            "reason": self.reason,
+            "message": self.message,
+            "lastTransitionTime": self.last_transition_time.isoformat(),
+            "observedGeneration": self.observed_generation,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "Condition":
+        ts = d.get("lastTransitionTime", "")
+        try:
+            dt = datetime.fromisoformat(ts)
+        except (ValueError, TypeError):
+            dt = datetime.now(timezone.utc)
+        return cls(
+            type=d["type"],
+            status=d["status"],
+            reason=d.get("reason", ""),
+            message=d.get("message", ""),
+            last_transition_time=dt,
+            observed_generation=d.get("observedGeneration", 0),
+        )
 
 
 class DatabaseManager:
@@ -649,6 +690,74 @@ class DatabaseManager:
 
             await conn.execute(full_query, *params)
 
+    async def set_condition(
+        self,
+        resource_id: int,
+        condition_type: str,
+        status: str,
+        reason: str,
+        message: str = "",
+        observed_generation: int = 0,
+    ) -> None:
+        """
+        Set or update a named condition on a resource.
+
+        Only updates lastTransitionTime when the condition status changes,
+        preserving it on repeated updates with the same status value.
+
+        Args:
+            resource_id: The resource ID.
+            condition_type: Condition type identifier (e.g. 'Ready').
+            status: Condition status — "True", "False", or "Unknown".
+            reason: Short CamelCase reason string.
+            message: Human-readable detail message.
+            observed_generation: Generation when this condition was set.
+        """
+        now = datetime.now(timezone.utc)
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT conditions FROM resources WHERE id = $1", resource_id
+            )
+            if row is None:
+                return
+
+            raw = row["conditions"]
+            existing_conditions: List[Dict[str, Any]] = (
+                json.loads(raw) if isinstance(raw, str) else (raw or [])
+            )
+
+            existing = next(
+                (c for c in existing_conditions if c.get("type") == condition_type),
+                None,
+            )
+
+            if existing is not None and existing.get("status") == status:
+                # Status unchanged — preserve lastTransitionTime
+                last_transition = existing.get("lastTransitionTime", now.isoformat())
+            else:
+                last_transition = now.isoformat()
+
+            new_condition: Dict[str, Any] = {
+                "type": condition_type,
+                "status": status,
+                "reason": reason,
+                "message": message,
+                "lastTransitionTime": last_transition,
+                "observedGeneration": observed_generation,
+            }
+
+            updated = [
+                c for c in existing_conditions if c.get("type") != condition_type
+            ]
+            updated.append(new_condition)
+
+            await conn.execute(
+                "UPDATE resources SET conditions = $1::jsonb, updated_at = NOW() "
+                "WHERE id = $2",
+                json.dumps(updated),
+                resource_id,
+            )
+
     async def record_reconciliation(
         self,
         resource_id: int,
@@ -911,6 +1020,11 @@ class DatabaseManager:
             json.loads(result["finalizers"])
             if isinstance(result.get("finalizers"), str)
             else result.get("finalizers", []) or []
+        )
+        result["conditions"] = (
+            json.loads(result["conditions"])
+            if isinstance(result.get("conditions"), str)
+            else result.get("conditions", []) or []
         )
         return result
 

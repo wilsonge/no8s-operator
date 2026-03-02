@@ -15,6 +15,7 @@ no8s-operator brings the power of Kubernetes-style declarative infrastructure ma
 - **Resource Types with Schema Validation**: Define resource types with OpenAPI v3 schemas (similar to Kubernetes CRDs)
 - **Plugin Architecture**: Extensible inputs (HTTP API, polling, queues) and actions (GitHub Actions, GitLab, HTTP)
 - **Automatic Reconciliation**: Continuous drift detection and correction
+- **Status Conditions**: Kubernetes-style named conditions (`Ready`, `Reconciling`, `Degraded`) plus custom conditions set by reconciler plugins
 - **Audit History**: Complete history of all reconciliation attempts
 
 In some environments for a variety of reasons Kubernetes isn't an option - but you still want the benefits of managing
@@ -150,6 +151,21 @@ curl -X POST http://localhost:8000/api/v1/resources \
 curl http://localhost:8000/api/v1/resources/1
 ```
 
+The response includes a `conditions` array alongside the `status` phase field:
+
+```json
+{
+  "id": 1,
+  "name": "production-pg",
+  "status": "ready",
+  "conditions": [
+    {"type": "Ready",       "status": "True",    "reason": "ReconcileSuccess", ...},
+    {"type": "Reconciling", "status": "False",   "reason": "ReconcileComplete", ...},
+    {"type": "Degraded",    "status": "False",   "reason": "NoErrors", ...}
+  ]
+}
+```
+
 ### View Reconciliation History
 
 ```bash
@@ -158,11 +174,28 @@ curl http://localhost:8000/api/v1/resources/1/history
 
 ## Resource Lifecycle
 
+Resources track state in two complementary ways:
+
+**Phase** — the `status` field, a coarse-grained state machine:
+
 ```
 pending → reconciling → ready
                       ↓
                     failed → (exponential backoff) → reconciling
+
+Deletion:
+ready/failed → deleting → (destroy + finalizer removal) → hard delete
 ```
+
+**Conditions** — the `conditions` array, named boolean states with `lastTransitionTime`:
+
+| Condition | Meaning |
+|-----------|---------|
+| `Ready` | Resource matches desired state (`True`) or has errors (`False`) |
+| `Reconciling` | Actively being reconciled right now |
+| `Degraded` | Resource is in an error state |
+
+Reconciler plugins can add domain-specific conditions (e.g. `ReplicationHealthy`, `SchemaApplied`) via `ctx.set_condition()`.
 
 ## Project Structure
 
