@@ -158,7 +158,7 @@ Non-admin users need the `view_plugins` system permission on their custom role t
 
 ## Next steps
 
-- **Register resource types** — before creating resources, the corresponding resource type (schema) must exist. See the [Resource Types section in the README](../CLAUDE.md#creating-a-resource-type).
-- **Create resources** — use `POST /api/v1/resources` to declare desired state. The appropriate reconciler picks it up and drives it to `ready`.
+- **Register resource types** — before creating resources, the corresponding resource type (schema) must exist. See [`docs/resource-types.md`](resource-types.md).
+- **Create resources** — use `POST /api/v1/resources` to declare desired state. The appropriate reconciler picks it up and drives it to `ready`. See [`docs/resources.md`](resources.md).
 - **Write your own reconciler** — see [`docs/writing-a-reconciler.md`](writing-a-reconciler.md) for a full walkthrough.
 - **Manage users and RBAC** — see [`docs/users.md`](users.md) for authentication, custom roles, and LDAP.
