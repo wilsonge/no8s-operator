@@ -37,11 +37,10 @@ See [docs/installation.md](docs/installation.md) for manual installation, enviro
 
 - [ ] Terraform backend storing state in the operator's PostgreSQL database
 - [ ] OIDC authentication for users and services (e.g. GitLab)
-- [ ] Git input plugin — trigger reconcilers when repositories are tagged
+- [ ] GitOps integration (watch Git repos for changes)
 - [ ] Backstage integration
 - [ ] Multi-controller support with leader election
 - [ ] Prometheus metrics
-- [ ] GitOps integration (watch Git repos for changes)
 - [ ] Policy enforcement (OPA integration)
 - [ ] Slack/email notifications
 - [ ] Stable plugin API with backwards-compatibility guarantees
