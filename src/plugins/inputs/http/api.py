@@ -587,7 +587,7 @@ class HTTPInputPlugin(InputPlugin):
         Set up all FastAPI routes for the REST API.
 
         Configures the following endpoint groups:
-        - Health check: GET /
+        - Health check: GET /health
         - Resource Types CRUD: /api/v1/resource-types
         - Resources CRUD: /api/v1/resources
         - Resource by name: /api/v1/resources/by-name/{name}
@@ -602,7 +602,7 @@ class HTTPInputPlugin(InputPlugin):
         if not self.app:
             raise RuntimeError("App not initialized")
 
-        @self.app.get("/")
+        @self.app.get("/health")
         async def health_check():
             """Health check endpoint."""
             return {"status": "ok", "service": "infrastructure-controller"}

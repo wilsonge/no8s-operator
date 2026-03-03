@@ -23,6 +23,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: operator-controller-api
+    restart: unless-stopped
     ports:
       - "8000:8000"
     environment:
@@ -31,11 +32,24 @@ services:
       - DB_NAME=operator_controller
       - DB_USER=operator
       - DB_PASSWORD=operator
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - JWT_EXPIRY_HOURS=${JWT_EXPIRY_HOURS:-24}
+      - INITIAL_ADMIN_USERNAME=${INITIAL_ADMIN_USERNAME:-admin}
+      - INITIAL_ADMIN_PASSWORD=${INITIAL_ADMIN_PASSWORD:-changeme123}
       - GITHUB_TOKEN=${GITHUB_TOKEN:-}
       - GITHUB_ACTIONS_TIMEOUT=${GITHUB_ACTIONS_TIMEOUT:-3600}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - RECONCILE_INTERVAL=${RECONCILE_INTERVAL:-60}
+      - MAX_CONCURRENT_RECONCILES=${MAX_CONCURRENT_RECONCILES:-5}
     depends_on:
       postgres:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
 
 volumes:
   postgres_data:
