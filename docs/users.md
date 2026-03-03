@@ -4,22 +4,32 @@ This guide covers authentication, role-based access control, manual user creatio
 
 ## Concepts
 
-All API endpoints (except `POST /api/v1/auth/login`) require a valid JWT bearer token. Every user has a **base role** and an optional **custom role** that together determine what they can do.
+All API endpoints (except `POST /api/v1/auth/login`) require a valid JWT bearer token. Access is controlled by two complementary mechanisms:
 
-### Base roles
+### Admin flag
 
-| Role | What they can do |
-|---|---|
-| `admin` | Everything — full access to all endpoints including user and custom role management |
-| `viewer` | Any authenticated endpoint that requires no specific resource permission (health, plugins, resource types, admission webhooks read, event stream) |
+Each user has an `is_admin` boolean. Admins bypass all permission checks and have full access to every endpoint. All other users must have a custom role to do anything meaningful.
 
 ### Custom roles
 
-Custom roles grant granular access to **resources** (not system configuration). A custom role is a named set of permissions, where each permission targets a specific resource type (or `*` for all types) and version (or `*` for all versions), and lists which CRUD operations are allowed.
+Custom roles are the sole mechanism for granting access to non-admin users. A role has two independent parts:
 
-A user with base role `viewer` and no custom role cannot read, create, update, or delete any resources. Assigning them a custom role grants exactly the operations that role permits for the matching resource types.
+**Resource permissions** — controls which CRUD operations a user may perform on specific resource types:
 
-Admins bypass custom role checks entirely and always have full access.
+| Field | Description |
+|---|---|
+| `resource_type_name` | Resource type name, or `*` for all types |
+| `resource_type_version` | Resource type version, or `*` for all versions |
+| `operations` | List of `CREATE`, `READ`, `UPDATE`, `DELETE` |
+
+**System permissions** — controls access to system-level read endpoints:
+
+| Value | Grants access to |
+|---|---|
+| `"view_webhooks"` | `GET /api/v1/admission-webhooks` and `GET /api/v1/admission-webhooks/{id}` |
+| `"view_plugins"` | `GET /api/v1/plugins/actions` and `GET /api/v1/plugins/inputs` |
+
+A user with no custom role can only read resource types and their own identity (`/api/v1/auth/me`). Assigning a custom role grants exactly the operations that role permits.
 
 Users come from two sources:
 
@@ -70,7 +80,7 @@ Response:
   "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
   "token_type": "bearer",
   "username": "admin",
-  "role": "admin"
+  "is_admin": true
 }
 ```
 
@@ -91,7 +101,7 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/v1/auth/me
 
 ## Manual users
 
-All user management endpoints require the `admin` role.
+All user management endpoints require admin access.
 
 ### Create a user
 
@@ -104,7 +114,7 @@ curl -X POST http://localhost:8000/api/v1/users \
     "password": "securepass1",
     "email": "alice@example.com",
     "display_name": "Alice Smith",
-    "role": "viewer",
+    "is_admin": false,
     "custom_role_id": 3
   }'
 ```
@@ -115,8 +125,8 @@ Fields:
 |---|---|---|
 | `username` | Yes | Lowercase alphanumeric + hyphens, max 63 chars |
 | `password` | Yes | Min 8 characters |
-| `role` | No | `admin` or `viewer` (default: `viewer`) |
-| `custom_role_id` | No | ID of a custom role granting resource permissions |
+| `is_admin` | No | `true` for full admin access (default: `false`) |
+| `custom_role_id` | No | ID of a custom role granting resource and/or system permissions |
 | `email` | No | |
 | `display_name` | No | |
 
@@ -126,12 +136,12 @@ Fields:
 # All users
 curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/v1/users
 
-# Filter by role or source
+# Filter by is_admin or source
 curl -H "Authorization: Bearer $TOKEN" \
-  'http://localhost:8000/api/v1/users?role=viewer&source=manual'
+  'http://localhost:8000/api/v1/users?is_admin=false&source=manual'
 ```
 
-Query parameters: `source` (`manual`/`ldap`), `role` (`admin`/`viewer`), `status` (`active`/`suspended`), `limit` (default 100).
+Query parameters: `source` (`manual`/`ldap`), `is_admin` (`true`/`false`), `status` (`active`/`suspended`), `limit` (default 100).
 
 ### Get a user
 
@@ -145,10 +155,10 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/v1/users/1
 curl -X PUT http://localhost:8000/api/v1/users/1 \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"role": "admin", "display_name": "Alice (Admin)"}'
+  -d '{"is_admin": true, "display_name": "Alice (Admin)"}'
 ```
 
-Updatable fields: `email`, `display_name`, `role`, `status`, `custom_role_id`.
+Updatable fields: `email`, `display_name`, `is_admin`, `status`, `custom_role_id`.
 
 ### Suspend a user
 
@@ -171,13 +181,13 @@ curl -X PUT http://localhost:8000/api/v1/users/1 \
 
 ## Custom roles
 
-Custom roles control access to resources. An admin creates a role, adds permissions to it, then assigns it to one or more users via `custom_role_id`.
+Custom roles control access for non-admin users. An admin creates a role, configures its permissions, then assigns it to users via `custom_role_id`.
 
-All custom role endpoints require the `admin` role.
+All custom role endpoints require admin access.
 
 ### Create a custom role
 
-Permissions can be included inline at creation time:
+Resource permissions and system permissions can be included at creation time:
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/custom-roles \
@@ -186,6 +196,7 @@ curl -X POST http://localhost:8000/api/v1/custom-roles \
   -d '{
     "name": "db-writer",
     "description": "Full access to DatabaseCluster resources",
+    "system_permissions": ["view_webhooks"],
     "permissions": [
       {
         "resource_type_name": "DatabaseCluster",
@@ -203,6 +214,7 @@ Response:
   "id": 3,
   "name": "db-writer",
   "description": "Full access to DatabaseCluster resources",
+  "system_permissions": ["view_webhooks"],
   "permissions": [
     {
       "id": 1,
@@ -229,14 +241,14 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/v1/custom-roles
 
 ### Update a custom role
 
-Updates the name and/or description only. To change permissions, use the permissions sub-endpoints below.
-
 ```bash
 curl -X PUT http://localhost:8000/api/v1/custom-roles/3 \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"description": "Updated description"}'
+  -d '{"system_permissions": ["view_webhooks", "view_plugins"]}'
 ```
+
+Updatable fields: `name`, `description`, `system_permissions`. To change resource permissions, use the permissions sub-endpoints below.
 
 ### Delete a custom role
 
@@ -247,7 +259,7 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" \
 
 Deleting a custom role sets `custom_role_id` to `NULL` on any users assigned to it.
 
-### Managing permissions
+### Managing resource permissions
 
 #### Add a permission
 
@@ -310,7 +322,7 @@ LDAP support is entirely optional. When `LDAP_URL` is not set the operator runs 
 ### How it works
 
 1. The operator binds to the directory using a service account (`LDAP_BIND_DN` / `LDAP_BIND_PASSWORD`) and searches for users matching `LDAP_USER_FILTER` under `LDAP_BASE_DN`.
-2. Each found entry is upserted into the local users table (keyed on username). New users receive the `LDAP_DEFAULT_ROLE`.
+2. Each found entry is upserted into the local users table (keyed on username). New users are created with `is_admin=False` and no custom role; an admin assigns roles post-sync.
 3. At login time, instead of checking a stored password, the operator attempts a bind to the LDAP server using the user's stored DN and the password they provided. This means the LDAP server is the single source of truth for credentials — password changes in the directory take effect immediately.
 
 LDAP users **must be synced** before they can log in. A user who exists in the directory but has never been synced will get a 401.
@@ -327,7 +339,6 @@ LDAP users **must be synced** before they can log in. A user who exists in the d
 | `LDAP_ATTR_USERNAME` | `uid` | Attribute used as the no8s username |
 | `LDAP_ATTR_EMAIL` | `mail` | Attribute mapped to email |
 | `LDAP_ATTR_DISPLAY_NAME` | `cn` | Attribute mapped to display name |
-| `LDAP_DEFAULT_ROLE` | `viewer` | Role assigned to newly synced users |
 | `LDAP_SYNC_INTERVAL` | `0` | Seconds between automatic syncs. `0` disables background sync. |
 
 Example startup with LDAP enabled and automatic sync every 10 minutes:
@@ -338,7 +349,6 @@ LDAP_URL=ldap://ldap.example.com:389 \
 LDAP_BIND_DN="cn=svc-no8s,ou=service-accounts,dc=example,dc=com" \
 LDAP_BIND_PASSWORD=svc-password \
 LDAP_BASE_DN="ou=people,dc=example,dc=com" \
-LDAP_DEFAULT_ROLE=viewer \
 LDAP_SYNC_INTERVAL=600 \
 python src/main.py
 ```
@@ -381,28 +391,28 @@ LDAP_ATTR_DISPLAY_NAME=cn
 
 Resource endpoints use per-resource-type permission checks. Admins pass all checks unconditionally. Non-admin users must have a custom role with a matching permission for the resource type and operation.
 
-| Endpoint | Minimum role |
+| Endpoint | Required |
 |---|---|
 | `POST /api/v1/auth/login` | None (public) |
 | `GET /api/v1/auth/me` | Any authenticated user |
-| `GET /api/v1/users` | admin |
-| `POST /api/v1/users` | admin |
-| `GET /api/v1/users/{id}` | admin |
-| `PUT /api/v1/users/{id}` | admin |
-| `DELETE /api/v1/users/{id}` | admin |
-| `POST /api/v1/users/ldap-sync` | admin |
-| `GET /api/v1/custom-roles` | admin |
-| `POST /api/v1/custom-roles` | admin |
-| `GET /api/v1/custom-roles/{id}` | admin |
-| `PUT /api/v1/custom-roles/{id}` | admin |
-| `DELETE /api/v1/custom-roles/{id}` | admin |
-| `POST /api/v1/custom-roles/{id}/permissions` | admin |
-| `PUT /api/v1/custom-roles/{id}/permissions/{perm_id}` | admin |
-| `DELETE /api/v1/custom-roles/{id}/permissions/{perm_id}` | admin |
-| `GET /api/v1/resource-types` | Any authenticated user |
-| `POST /api/v1/resource-types` | admin |
-| `PUT /api/v1/resource-types/{id}` | admin |
-| `DELETE /api/v1/resource-types/{id}` | admin |
+| `GET /api/v1/users` | Admin |
+| `POST /api/v1/users` | Admin |
+| `GET /api/v1/users/{id}` | Admin |
+| `PUT /api/v1/users/{id}` | Admin |
+| `DELETE /api/v1/users/{id}` | Admin |
+| `POST /api/v1/users/ldap-sync` | Admin |
+| `GET /api/v1/custom-roles` | Admin |
+| `POST /api/v1/custom-roles` | Admin |
+| `GET /api/v1/custom-roles/{id}` | Admin |
+| `PUT /api/v1/custom-roles/{id}` | Admin |
+| `DELETE /api/v1/custom-roles/{id}` | Admin |
+| `POST /api/v1/custom-roles/{id}/permissions` | Admin |
+| `PUT /api/v1/custom-roles/{id}/permissions/{perm_id}` | Admin |
+| `DELETE /api/v1/custom-roles/{id}/permissions/{perm_id}` | Admin |
+| `GET /api/v1/resource-types` (all three GET routes) | Any authenticated user |
+| `POST /api/v1/resource-types` | Admin |
+| `PUT /api/v1/resource-types/{id}` | Admin |
+| `DELETE /api/v1/resource-types/{id}` | Admin |
 | `GET /api/v1/resources` | Any authenticated user (list filtered by custom role READ permissions) |
 | `POST /api/v1/resources` | Custom role with CREATE on the resource type |
 | `GET /api/v1/resources/{id}` | Custom role with READ on the resource type |
@@ -414,11 +424,12 @@ Resource endpoints use per-resource-type permission checks. Admins pass all chec
 | `GET /api/v1/resources/{id}/history` | Custom role with READ on the resource type |
 | `GET /api/v1/resources/{id}/outputs` | Custom role with READ on the resource type |
 | `GET /api/v1/resources/{id}/events` | Custom role with READ on the resource type |
-| `GET /api/v1/events` | Any authenticated user |
-| `GET /api/v1/admission-webhooks` | Any authenticated user |
-| `POST /api/v1/admission-webhooks` | admin |
-| `GET /api/v1/admission-webhooks/{id}` | Any authenticated user |
-| `PUT /api/v1/admission-webhooks/{id}` | admin |
-| `DELETE /api/v1/admission-webhooks/{id}` | admin |
-| `GET /api/v1/plugins/*` | Any authenticated user |
+| `GET /api/v1/events` | Any authenticated user (events filtered to READ-permitted types) |
+| `GET /api/v1/admission-webhooks` | Custom role with `view_webhooks` system permission |
+| `POST /api/v1/admission-webhooks` | Admin |
+| `GET /api/v1/admission-webhooks/{id}` | Custom role with `view_webhooks` system permission |
+| `PUT /api/v1/admission-webhooks/{id}` | Admin |
+| `DELETE /api/v1/admission-webhooks/{id}` | Admin |
+| `GET /api/v1/plugins/actions` | Custom role with `view_plugins` system permission |
+| `GET /api/v1/plugins/inputs` | Custom role with `view_plugins` system permission |
 | `GET /` (health check) | None (public) |

@@ -298,8 +298,8 @@ PostgreSQL tables:
 - **admission_webhooks**: Webhook endpoints for validating/mutating before persistence
 - **reconciliation_history**: Audit log of reconciliation attempts
 - **locks**: Distributed locking (for future multi-controller support)
-- **users**: Manual and LDAP-synced users with bcrypt passwords, roles, and status
-- **custom_roles**: Named permission sets assignable to users
+- **users**: Manual and LDAP-synced users with bcrypt passwords, `is_admin` flag, and status
+- **custom_roles**: Named permission sets assignable to users; includes `system_permissions` JSONB for system-level access flags
 - **custom_role_permissions**: Per-role permissions scoped by resource type, version, and CRUD operations
 
 ### Controller Settings
@@ -399,13 +399,14 @@ Kubernetes-style named conditions stored as a `conditions` JSONB array on each r
 
 All API endpoints except `POST /api/v1/auth/login` and `GET /` require a JWT bearer token.
 
-**Two-tier permission model:**
+**Permission model:**
 
-- **Base role** (`admin` or `viewer`) — carried in the JWT. Admins bypass all permission checks.
-- **Custom role** — a named set of resource-type-scoped CRUD permissions (`CREATE`, `READ`, `UPDATE`, `DELETE`) assigned to a user via `custom_role_id`. Non-admin users need a matching custom role permission to access any resource endpoint.
+- **`is_admin` flag** — a boolean on the user record, carried in the JWT. Admins bypass all permission checks.
+- **Custom role (resource permissions)** — a named set of resource-type-scoped CRUD permissions (`CREATE`, `READ`, `UPDATE`, `DELETE`) assigned via `custom_role_id`. Non-admin users need a matching permission to access any resource endpoint.
+- **Custom role (system permissions)** — the `system_permissions` JSONB array on the custom role grants access to system-level read endpoints. Valid values: `"view_webhooks"`, `"view_plugins"`.
 
 **Key files:**
-- `src/auth.py` — `AuthManager` (JWT + bcrypt), FastAPI dependency functions (`require_admin`, `require_viewer`, `get_current_user`, `check_resource_permission`), module-level singleton
+- `src/auth.py` — `AuthManager` (JWT + bcrypt), FastAPI dependency functions (`require_admin`, `get_current_user`, `check_resource_permission`, `check_system_permission`), module-level singleton
 - `src/ldap_sync.py` — `LDAPSyncManager`: binds to LDAP, searches for users, upserts into the local users table
 
 **Dependency functions used on routes:**
@@ -413,14 +414,21 @@ All API endpoints except `POST /api/v1/auth/login` and `GET /` require a JWT bea
 | Dependency | Used on |
 |---|---|
 | `require_admin` | User CRUD, custom role CRUD, resource type writes, admission webhook writes |
-| `require_viewer` | Resource type reads, admission webhook reads, plugin discovery, global event stream |
+| `get_current_user` | Resource type reads (any authenticated user) |
+| `get_current_user` + `check_system_permission("view_webhooks")` | Admission webhook reads |
+| `get_current_user` + `check_system_permission("view_plugins")` | Plugin discovery |
 | `get_current_user` + `check_resource_permission` | All resource endpoints (scoped by resource type) |
+| `get_current_user` (with role-filtered stream) | Global event stream |
 
 **Custom role permission matching** (`check_resource_permission` in `src/auth.py`): admins always pass; non-admin users need a permission row whose `resource_type_name` and `resource_type_version` match (or are `*`) and whose `operations` list includes the requested operation.
 
-**LDAP login flow:** at login time the operator binds to the LDAP server with the user's DN and the supplied password rather than checking a stored hash. The LDAP server is the source of truth for credentials. Users must be synced before they can log in.
+**System permission matching** (`check_system_permission` in `src/auth.py`): admins always pass; non-admin users need the named permission string in their custom role's `system_permissions` list.
 
-**Bootstrap:** if `INITIAL_ADMIN_USERNAME` and `INITIAL_ADMIN_PASSWORD` are set and the users table is empty, an admin user is created on startup.
+**Event stream filtering**: admins see all events. Non-admins receive only events for resource types where their custom role grants `READ`. Users with no custom role receive an empty stream.
+
+**LDAP login flow:** at login time the operator binds to the LDAP server with the user's DN and the supplied password rather than checking a stored hash. The LDAP server is the source of truth for credentials. Users must be synced before they can log in. Newly synced LDAP users start with `is_admin=False` and no custom role; an admin assigns roles post-sync.
+
+**Bootstrap:** if `INITIAL_ADMIN_USERNAME` and `INITIAL_ADMIN_PASSWORD` are set and the users table is empty, an admin user is created on startup with `is_admin=True`.
 
 See [`docs/users.md`](docs/users.md) for the full user management and RBAC reference.
 
@@ -455,7 +463,7 @@ Reconciliation triggers when `generation > observed_generation`.
 | Admission Webhooks               | HTTP callback webhooks with mutating/validating support         |
 | Phase (`status.phase`)           | `status` enum field (pending/reconciling/ready/failed/deleting) |
 | `metav1.Condition` / `meta.SetStatusCondition()` | `conditions` JSONB array + `db.set_condition()` / `ctx.set_condition()` |
-| RBAC / ClusterRole + ClusterRoleBinding | Custom roles with resource-type-scoped CRUD permissions, assigned via `custom_role_id` |
+| RBAC / ClusterRole + ClusterRoleBinding | Custom roles with resource-type-scoped CRUD permissions + system permission flags, assigned via `custom_role_id` |
 | ServiceAccount                   | Users (`manual` or `ldap` source) with JWT bearer tokens        |
 
 ## Monitoring
