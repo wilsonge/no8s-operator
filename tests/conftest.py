@@ -4,6 +4,8 @@ import pytest
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
+from auth import AuthManager
+
 
 @pytest.fixture
 def event_loop():
@@ -50,6 +52,57 @@ def sample_resource():
         "last_reconcile_time": None,
         "next_reconcile_time": None,
         "finalizers": ["github_actions"],
+    }
+
+
+@pytest.fixture
+def mock_auth_manager():
+    """An AuthManager instance pre-configured for tests."""
+    return AuthManager(jwt_secret_key="test-jwt-secret", jwt_expiry_hours=1)
+
+
+@pytest.fixture
+def admin_user_payload():
+    """JWT payload dict for an admin user."""
+    return {
+        "sub": "1",
+        "id": 1,
+        "username": "admin",
+        "is_admin": True,
+        "source": "manual",
+    }
+
+
+@pytest.fixture
+def viewer_user_payload():
+    """JWT payload dict for a non-admin user."""
+    return {
+        "sub": "2",
+        "id": 2,
+        "username": "viewer",
+        "is_admin": False,
+        "source": "manual",
+    }
+
+
+@pytest.fixture
+def sample_user():
+    """Sample user data dict for testing."""
+    return {
+        "id": 1,
+        "username": "testuser",
+        "email": "test@example.com",
+        "display_name": "Test User",
+        "source": "manual",
+        "is_admin": False,
+        "status": "active",
+        "password_hash": None,
+        "ldap_dn": None,
+        "ldap_uid": None,
+        "created_at": None,
+        "updated_at": None,
+        "last_login_at": None,
+        "last_synced_at": None,
     }
 
 

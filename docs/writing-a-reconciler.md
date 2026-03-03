@@ -14,7 +14,7 @@ This guide walks through building a no8s reconciler plugin. If you've written a 
 | `ctrl.Result{RequeueAfter: ...}` | `ReconcileResult(requeue_after=seconds)`                    |
 | Entry in `manager.Register()`    | Python entry point in `no8s.reconcilers` group              |
 
-The operator discovers your plugin at startup via Python entry points (like a Kubernetes controller-manager discovering controllers), creates a `ReconcilerContext` (your handle to the operator's internals), and calls your `start()` method in its own asyncio task.
+The operator discovers your plugin at startup via Python entry points, creates a `ReconcilerContext` (your handle to the operator's internals), and calls your `start()` method in its own asyncio task.
 
 ## Project Structure
 
@@ -203,7 +203,7 @@ class DnsRecordReconciler(ReconcilerPlugin):
 
 ## Step 2: Register via Entry Point
 
-In your `pyproject.toml`, declare the entry point so the operator discovers your plugin at startup. This is the equivalent of registering a controller with the controller-manager.
+In your `pyproject.toml`, declare the entry point so the operator discovers your plugin at startup.
 
 ```toml
 [project]
@@ -213,6 +213,7 @@ dependencies = [
     "no8s-operator",
 ]
 
+# This ensures the operator discovers your reconciler.
 [project.entry-points.'no8s.reconcilers']
 dns_record = "no8s_dns.reconciler:DnsRecordReconciler"
 

@@ -10,6 +10,9 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+# LDAPConfig is also defined in ldap_sync.py but we keep a copy here so
+# config.py has no import-time dependency on ldap3 (optional package).
+
 
 @dataclass
 class DatabaseConfig:
@@ -143,6 +146,59 @@ class PluginConfig:
 
 
 @dataclass
+class AuthConfig:
+    """JWT authentication configuration."""
+
+    jwt_secret_key: str = field(default="", repr=False)
+    jwt_expiry_hours: int = 24
+    initial_admin_username: Optional[str] = None
+    initial_admin_password: Optional[str] = field(default=None, repr=False)
+
+    @classmethod
+    def from_env(cls) -> "AuthConfig":
+        """Load from environment variables."""
+        secret = os.getenv("JWT_SECRET_KEY", "")
+        if not secret:
+            raise ValueError("JWT_SECRET_KEY environment variable must be set.")
+        return cls(
+            jwt_secret_key=secret,
+            jwt_expiry_hours=int(os.getenv("JWT_EXPIRY_HOURS", "24")),
+            initial_admin_username=os.getenv("INITIAL_ADMIN_USERNAME"),
+            initial_admin_password=os.getenv("INITIAL_ADMIN_PASSWORD"),
+        )
+
+
+@dataclass
+class LDAPConfig:
+    """LDAP directory configuration (all fields optional — LDAP is optional)."""
+
+    url: Optional[str] = None
+    bind_dn: Optional[str] = None
+    bind_password: Optional[str] = field(default=None, repr=False)
+    base_dn: Optional[str] = None
+    user_filter: str = "(objectClass=inetOrgPerson)"
+    attr_username: str = "uid"
+    attr_email: str = "mail"
+    attr_display_name: str = "cn"
+    sync_interval: int = 0  # 0 = disabled
+
+    @classmethod
+    def from_env(cls) -> "LDAPConfig":
+        """Load from environment variables."""
+        return cls(
+            url=os.getenv("LDAP_URL"),
+            bind_dn=os.getenv("LDAP_BIND_DN"),
+            bind_password=os.getenv("LDAP_BIND_PASSWORD"),
+            base_dn=os.getenv("LDAP_BASE_DN"),
+            user_filter=os.getenv("LDAP_USER_FILTER", "(objectClass=inetOrgPerson)"),
+            attr_username=os.getenv("LDAP_ATTR_USERNAME", "uid"),
+            attr_email=os.getenv("LDAP_ATTR_EMAIL", "mail"),
+            attr_display_name=os.getenv("LDAP_ATTR_DISPLAY_NAME", "cn"),
+            sync_interval=int(os.getenv("LDAP_SYNC_INTERVAL", "0")),
+        )
+
+
+@dataclass
 class Config:
     """Main configuration object."""
 
@@ -150,6 +206,8 @@ class Config:
     controller: ControllerConfig
     api: APIConfig
     plugins: PluginConfig
+    auth: AuthConfig = field(default_factory=AuthConfig)
+    ldap: LDAPConfig = field(default_factory=LDAPConfig)
 
     @classmethod
     def from_env(cls):
@@ -159,6 +217,8 @@ class Config:
             controller=ControllerConfig.from_env(),
             api=APIConfig.from_env(),
             plugins=PluginConfig.from_env(),
+            auth=AuthConfig.from_env(),
+            ldap=LDAPConfig.from_env(),
         )
 
     @classmethod
@@ -169,6 +229,8 @@ class Config:
             controller=ControllerConfig(),
             api=APIConfig(),
             plugins=PluginConfig(),
+            auth=AuthConfig(),
+            ldap=LDAPConfig(),
         )
 
 

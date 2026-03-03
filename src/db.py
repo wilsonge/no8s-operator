@@ -1270,3 +1270,383 @@ class DatabaseManager:
             else result.get("operations", [])
         )
         return result
+
+    # ==================================================================
+    # User management
+    # ==================================================================
+
+    def _parse_user_row(self, row: asyncpg.Record) -> Dict[str, Any]:
+        """Convert an asyncpg Record from the users table to a plain dict."""
+        result = dict(row)
+        # Enum columns come back as strings from asyncpg; normalise them.
+        for col in ("source", "status"):
+            if result.get(col) is not None:
+                result[col] = str(result[col])
+        return result
+
+    # ------------------------------------------------------------------
+    # Custom Role methods
+    # ------------------------------------------------------------------
+
+    def _parse_custom_role_row(self, row: asyncpg.Record) -> Dict[str, Any]:
+        """Convert an asyncpg Record from custom_roles to a plain dict."""
+        result = dict(row)
+        if isinstance(result.get("system_permissions"), str):
+            result["system_permissions"] = json.loads(result["system_permissions"])
+        elif result.get("system_permissions") is None:
+            result["system_permissions"] = []
+        return result
+
+    def _parse_permission_row(self, row: asyncpg.Record) -> Dict[str, Any]:
+        """Convert an asyncpg Record from custom_role_permissions to a plain dict."""
+        result = dict(row)
+        if isinstance(result.get("operations"), str):
+            result["operations"] = json.loads(result["operations"])
+        return result
+
+    async def _get_permissions_for_role(
+        self, conn, role_id: int
+    ) -> List[Dict[str, Any]]:
+        rows = await conn.fetch(
+            "SELECT * FROM custom_role_permissions WHERE role_id = $1 ORDER BY id",
+            role_id,
+        )
+        return [self._parse_permission_row(r) for r in rows]
+
+    async def create_custom_role(
+        self,
+        name: str,
+        description: Optional[str] = None,
+        system_permissions: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Insert a new custom role and return the created record."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO custom_roles (name, description, system_permissions)
+                VALUES ($1, $2, $3::jsonb)
+                RETURNING *
+                """,
+                name,
+                description,
+                json.dumps(system_permissions or []),
+            )
+            result = self._parse_custom_role_row(row)
+            result["permissions"] = []
+            return result
+
+    async def get_custom_role(self, role_id: int) -> Optional[Dict[str, Any]]:
+        """Return a custom role by primary key with its permissions, or None."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM custom_roles WHERE id = $1", role_id
+            )
+            if not row:
+                return None
+            result = self._parse_custom_role_row(row)
+            result["permissions"] = await self._get_permissions_for_role(conn, role_id)
+            return result
+
+    async def list_custom_roles(self) -> List[Dict[str, Any]]:
+        """Return all custom roles with their permissions."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("SELECT * FROM custom_roles ORDER BY id")
+            results = []
+            for row in rows:
+                result = self._parse_custom_role_row(row)
+                result["permissions"] = await self._get_permissions_for_role(
+                    conn, result["id"]
+                )
+                results.append(result)
+            return results
+
+    async def update_custom_role(
+        self,
+        role_id: int,
+        *,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        system_permissions: Optional[List[str]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Update a custom role's fields. Returns updated record or None."""
+        sets = ["updated_at = NOW()"]
+        params: List[Any] = []
+
+        if name is not None:
+            params.append(name)
+            sets.append(f"name = ${len(params)}")
+        if description is not None:
+            params.append(description)
+            sets.append(f"description = ${len(params)}")
+        if system_permissions is not None:
+            params.append(json.dumps(system_permissions))
+            sets.append(f"system_permissions = ${len(params)}::jsonb")
+
+        params.append(role_id)
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"UPDATE custom_roles SET {', '.join(sets)} "
+                f"WHERE id = ${len(params)} RETURNING *",
+                *params,
+            )
+            if not row:
+                return None
+            result = self._parse_custom_role_row(row)
+            result["permissions"] = await self._get_permissions_for_role(conn, role_id)
+            return result
+
+    async def delete_custom_role(self, role_id: int) -> bool:
+        """Delete a custom role. Returns True if a row was deleted."""
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM custom_roles WHERE id = $1", role_id
+            )
+            return result.split()[-1] != "0"
+
+    async def add_role_permission(
+        self,
+        role_id: int,
+        resource_type_name: str,
+        resource_type_version: str,
+        operations: List[str],
+    ) -> Dict[str, Any]:
+        """Add a permission entry to a custom role."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO custom_role_permissions
+                    (role_id, resource_type_name, resource_type_version, operations)
+                VALUES ($1, $2, $3, $4::jsonb)
+                RETURNING *
+                """,
+                role_id,
+                resource_type_name,
+                resource_type_version,
+                json.dumps(operations),
+            )
+            return self._parse_permission_row(row)
+
+    async def update_role_permission(
+        self, permission_id: int, operations: List[str]
+    ) -> Optional[Dict[str, Any]]:
+        """Update the operations list for a permission. Returns updated record or None."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE custom_role_permissions
+                SET operations = $1::jsonb
+                WHERE id = $2
+                RETURNING *
+                """,
+                json.dumps(operations),
+                permission_id,
+            )
+            return self._parse_permission_row(row) if row else None
+
+    async def delete_role_permission(self, permission_id: int) -> bool:
+        """Delete a permission entry. Returns True if a row was deleted."""
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM custom_role_permissions WHERE id = $1", permission_id
+            )
+            return result.split()[-1] != "0"
+
+    async def get_custom_role_permissions(self, role_id: int) -> List[Dict[str, Any]]:
+        """Return all permissions for a custom role (used by permission checker)."""
+        async with self.pool.acquire() as conn:
+            return await self._get_permissions_for_role(conn, role_id)
+
+    async def create_user(
+        self,
+        username: str,
+        is_admin: bool = False,
+        password_hash: Optional[str] = None,
+        email: Optional[str] = None,
+        display_name: Optional[str] = None,
+        source: str = "manual",
+    ) -> Dict[str, Any]:
+        """Insert a new user and return the created record."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO users
+                    (username, email, display_name, source, is_admin, password_hash)
+                VALUES ($1, $2, $3, $4::user_source, $5, $6)
+                RETURNING *
+                """,
+                username,
+                email,
+                display_name,
+                source,
+                is_admin,
+                password_hash,
+            )
+            return self._parse_user_row(row)
+
+    async def get_user(self, user_id: int) -> Optional[Dict[str, Any]]:
+        """Return a user by primary key, or None if not found."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
+            return self._parse_user_row(row) if row else None
+
+    async def get_user_by_username(self, username: str) -> Optional[Dict[str, Any]]:
+        """Return a user by username, or None if not found."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM users WHERE username = $1", username
+            )
+            return self._parse_user_row(row) if row else None
+
+    async def list_users(
+        self,
+        source: Optional[str] = None,
+        is_admin: Optional[bool] = None,
+        status: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Return users, optionally filtered by source / is_admin / status."""
+        conditions = []
+        params: List[Any] = []
+
+        if source is not None:
+            params.append(source)
+            conditions.append(f"source = ${len(params)}::user_source")
+        if is_admin is not None:
+            params.append(is_admin)
+            conditions.append(f"is_admin = ${len(params)}")
+        if status is not None:
+            params.append(status)
+            conditions.append(f"status = ${len(params)}::user_status")
+
+        where = "WHERE " + " AND ".join(conditions) if conditions else ""
+        params.append(limit)
+
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"SELECT * FROM users {where} ORDER BY id LIMIT ${len(params)}",
+                *params,
+            )
+            return [self._parse_user_row(r) for r in rows]
+
+    async def update_user(
+        self,
+        user_id: int,
+        *,
+        email: Optional[str] = None,
+        display_name: Optional[str] = None,
+        is_admin: Optional[bool] = None,
+        status: Optional[str] = None,
+        custom_role_id: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Update mutable user fields. Returns updated record or None."""
+        sets = ["updated_at = NOW()"]
+        params: List[Any] = []
+
+        if email is not None:
+            params.append(email)
+            sets.append(f"email = ${len(params)}")
+        if display_name is not None:
+            params.append(display_name)
+            sets.append(f"display_name = ${len(params)}")
+        if is_admin is not None:
+            params.append(is_admin)
+            sets.append(f"is_admin = ${len(params)}")
+        if status is not None:
+            params.append(status)
+            sets.append(f"status = ${len(params)}::user_status")
+        if custom_role_id is not None:
+            params.append(custom_role_id)
+            sets.append(f"custom_role_id = ${len(params)}")
+
+        params.append(user_id)
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"UPDATE users SET {', '.join(sets)} "
+                f"WHERE id = ${len(params)} RETURNING *",
+                *params,
+            )
+            return self._parse_user_row(row) if row else None
+
+    async def delete_user(self, user_id: int) -> bool:
+        """Soft-delete a user by setting status to 'suspended'.
+
+        Returns True if a row was updated.
+        """
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE users SET status = 'suspended'::user_status, "
+                "updated_at = NOW() WHERE id = $1",
+                user_id,
+            )
+            return result.split()[-1] != "0"
+
+    async def update_user_last_login(self, user_id: int) -> None:
+        """Stamp last_login_at for the given user."""
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET last_login_at = NOW() WHERE id = $1",
+                user_id,
+            )
+
+    async def upsert_ldap_user(
+        self,
+        ldap_dn: str,
+        ldap_uid: str,
+        username: str,
+        email: Optional[str],
+        display_name: Optional[str],
+    ) -> Dict[str, Any]:
+        """Insert or update an LDAP-sourced user.
+
+        On conflict (username) the record is updated in place.
+        Returns the upserted row with an extra '_created' bool key.
+        New LDAP users start with is_admin=False and no custom_role_id.
+        """
+        async with self.pool.acquire() as conn:
+            existing = await conn.fetchrow(
+                "SELECT id FROM users WHERE username = $1", username
+            )
+            if existing:
+                row = await conn.fetchrow(
+                    """
+                    UPDATE users
+                    SET email = $1, display_name = $2,
+                        ldap_dn = $3, ldap_uid = $4,
+                        source = 'ldap'::user_source,
+                        last_synced_at = NOW(),
+                        updated_at = NOW()
+                    WHERE username = $5
+                    RETURNING *
+                    """,
+                    email,
+                    display_name,
+                    ldap_dn,
+                    ldap_uid,
+                    username,
+                )
+                result = self._parse_user_row(row)
+                result["_created"] = False
+            else:
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO users
+                        (username, email, display_name, source,
+                         ldap_dn, ldap_uid, last_synced_at)
+                    VALUES ($1, $2, $3, 'ldap'::user_source, $4, $5, NOW())
+                    RETURNING *
+                    """,
+                    username,
+                    email,
+                    display_name,
+                    ldap_dn,
+                    ldap_uid,
+                )
+                result = self._parse_user_row(row)
+                result["_created"] = True
+            return result
+
+    async def count_users(self) -> int:
+        """Return the total number of users in the database."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT COUNT(*) AS n FROM users")
+            return int(row["n"])

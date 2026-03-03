@@ -91,6 +91,46 @@ CREATE TABLE IF NOT EXISTS admission_webhooks (
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
     );
 
+CREATE TYPE user_source AS ENUM ('manual', 'ldap');
+CREATE TYPE user_status AS ENUM ('active', 'suspended');
+
+CREATE TABLE IF NOT EXISTS users (
+    id              SERIAL PRIMARY KEY,
+    username        VARCHAR(255) UNIQUE NOT NULL,
+    email           VARCHAR(255),
+    display_name    VARCHAR(255),
+    source          user_source NOT NULL DEFAULT 'manual',
+    is_admin        BOOLEAN NOT NULL DEFAULT FALSE,
+    status          user_status NOT NULL DEFAULT 'active',
+    custom_role_id  INTEGER REFERENCES custom_roles(id) ON DELETE SET NULL,
+    password_hash   TEXT,          -- NULL for LDAP users
+    ldap_dn         TEXT,          -- Distinguished Name (LDAP users only)
+    ldap_uid        TEXT,          -- UID attribute value (LDAP users only)
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW(),
+    last_login_at   TIMESTAMPTZ,
+    last_synced_at  TIMESTAMPTZ    -- populated on LDAP sync
+    );
+
+CREATE TABLE custom_roles (
+    id                 SERIAL PRIMARY KEY,
+    name               VARCHAR(255) UNIQUE NOT NULL,
+    description        TEXT,
+    system_permissions JSONB NOT NULL DEFAULT '[]',
+    created_at         TIMESTAMPTZ DEFAULT NOW(),
+    updated_at         TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE custom_role_permissions (
+    id                    SERIAL PRIMARY KEY,
+    role_id               INTEGER NOT NULL REFERENCES custom_roles(id) ON DELETE CASCADE,
+    resource_type_name    VARCHAR(255) NOT NULL DEFAULT '*',
+    resource_type_version VARCHAR(255) NOT NULL DEFAULT '*',
+    operations            JSONB NOT NULL DEFAULT '["CREATE","READ","UPDATE","DELETE"]',
+    created_at            TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (role_id, resource_type_name, resource_type_version)
+);
+
 CREATE INDEX IF NOT EXISTS idx_resources_status
 ON resources(status) WHERE deleted_at IS NULL;
 
@@ -119,3 +159,10 @@ CREATE INDEX IF NOT EXISTS idx_admission_webhooks_resource_type
 CREATE INDEX IF NOT EXISTS idx_resources_conditions
     ON resources USING GIN (conditions)
     WHERE deleted_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
+CREATE INDEX IF NOT EXISTS idx_users_source   ON users(source);
+CREATE INDEX IF NOT EXISTS idx_users_status   ON users(status);
+CREATE INDEX IF NOT EXISTS idx_users_ldap_dn  ON users(ldap_dn);
+
+CREATE INDEX IF NOT EXISTS idx_users_custom_role_id ON users(custom_role_id);

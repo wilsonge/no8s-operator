@@ -52,15 +52,18 @@ The system follows a delegated controller pattern inspired by Kubernetes:
 
 1. **Main Loop (`controller.py`)** - Receives resource events, caches state, dispatches to reconciler plugins. Manages lifecycle, status tracking, and audit history.
 2. **Database Manager (`db.py`)** - PostgreSQL operations for resource definitions, cached state, and metadata.
-3. **Input Plugins** - Pluggable event sources. Currently: **HTTP API (`plugins/inputs/http/`)**.
-4. **Reconciler Plugins** - 3rd party pip packages discovered via entry points, owning reconciliation logic per resource type.
-5. **Action Plugins** - Optional executors for reconcilers. Currently: **GitHub Actions (`plugins/actions/github_actions/`)**.
+3. **Auth Manager (`auth.py`)** - JWT creation/validation, bcrypt password hashing, FastAPI dependency functions for RBAC, custom role permission checks.
+4. **LDAP Sync (`ldap_sync.py`)** - Optional LDAP integration for syncing users from a directory.
+5. **Input Plugins** - Pluggable event sources. Currently: **HTTP API (`plugins/inputs/http/`)**.
+6. **Reconciler Plugins** - 3rd party pip packages discovered via entry points, owning reconciliation logic per resource type.
+7. **Action Plugins** - Optional executors for reconcilers. Currently: **GitHub Actions (`plugins/actions/github_actions/`)**.
 
 ## Key Features
 
 - **Declarative Infrastructure**: Define desired state; reconciler plugins ensure it matches reality
 - **Resource Types with Schema Validation**: OpenAPI v3 schemas (similar to Kubernetes CRDs)
 - **3rd Party Reconcilers**: Auto-discovered via Python entry points
+- **Authentication and RBAC**: JWT bearer tokens, bcrypt passwords, LDAP integration, custom roles with per-resource-type CRUD permissions
 - **Finalizers**: Kubernetes-style deletion protection — resources cannot be hard-deleted until all finalizers are cleared
 - **Status Conditions**: Named conditions (`Ready`, `Reconciling`, `Degraded`) set automatically by the controller; reconciler plugins add domain-specific conditions via `ctx.set_condition()`
 - **Admission Webhooks**: HTTP callback-based validating and mutating webhooks before persistence
@@ -165,6 +168,8 @@ createdb operator_controller
 
 export DB_HOST=localhost DB_PORT=5432 DB_NAME=operator_controller
 export DB_USER=operator DB_PASSWORD=operator
+export JWT_SECRET_KEY=your-long-random-secret
+export INITIAL_ADMIN_USERNAME=admin INITIAL_ADMIN_PASSWORD=changeme123
 export GITHUB_TOKEN=ghp_your_token_here  # If reconcilers use GitHub Actions
 
 python src/main.py
@@ -172,12 +177,21 @@ python src/main.py
 
 ## Usage
 
+All API requests (except login and the health check) require a JWT bearer token. Obtain one first:
+
+```bash
+TOKEN=$(curl -s -X POST http://localhost:8000/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username": "admin", "password": "changeme123"}' | jq -r .access_token)
+```
+
 ### Creating a Resource
 
-Requires a resource type and a reconciler plugin installed for that type:
+Requires a resource type, a reconciler plugin installed for that type, and a custom role permission granting `CREATE` on the resource type (admins are exempt):
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/resources \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "production-pg",
@@ -198,8 +212,9 @@ The spec is validated against the resource type's schema (400 on failure). If no
 ### Checking Resource Status
 
 ```bash
-curl http://localhost:8000/api/v1/resources/1
-curl http://localhost:8000/api/v1/resources/by-name/DatabaseCluster/v1/production-pg
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/v1/resources/1
+curl -H "Authorization: Bearer $TOKEN" \
+  http://localhost:8000/api/v1/resources/by-name/DatabaseCluster/v1/production-pg
 ```
 
 Response includes: `id`, `name`, `resource_type_name`, `resource_type_version`, `status`, `status_message`, `generation`, `observed_generation`, `created_at`, `updated_at`, `last_reconcile_time`.
@@ -208,6 +223,7 @@ Response includes: `id`, `name`, `resource_type_name`, `resource_type_version`, 
 
 ```bash
 curl -X PUT http://localhost:8000/api/v1/resources/1 \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"spec": {"engine": "postgres", "instance_class": "db.xlarge", "storage_gb": 1000}}'
 ```
@@ -218,21 +234,23 @@ Triggers reconciliation: generation increments, reconciler executes changes, sta
 
 ```bash
 # Reconciliation history
-curl http://localhost:8000/api/v1/resources/1/history
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/v1/resources/1/history
 
 # Reconciler outputs (e.g. GitHub Actions job/artifact info)
-curl http://localhost:8000/api/v1/resources/1/outputs
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/v1/resources/1/outputs
 
 # Delete (soft-delete, then destroy via reconciler, then hard-delete when finalizers clear)
-curl -X DELETE http://localhost:8000/api/v1/resources/1
+curl -X DELETE -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/v1/resources/1
 
 # Manage finalizers
 curl -X PUT http://localhost:8000/api/v1/resources/1/finalizers \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"add": ["external-controller"]}'
 
 # Manual reconciliation trigger
-curl -X POST http://localhost:8000/api/v1/resources/1/reconcile
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  http://localhost:8000/api/v1/resources/1/reconcile
 ```
 
 ## Reconciliation Flow
@@ -280,6 +298,9 @@ PostgreSQL tables:
 - **admission_webhooks**: Webhook endpoints for validating/mutating before persistence
 - **reconciliation_history**: Audit log of reconciliation attempts
 - **locks**: Distributed locking (for future multi-controller support)
+- **users**: Manual and LDAP-synced users with bcrypt passwords, roles, and status
+- **custom_roles**: Named permission sets assignable to users
+- **custom_role_permissions**: Per-role permissions scoped by resource type, version, and CRUD operations
 
 ### Controller Settings
 
@@ -374,6 +395,35 @@ Kubernetes-style named conditions stored as a `conditions` JSONB array on each r
 
 **Implementation (`src/db.py`):** `DatabaseManager.set_condition()` fetches the current `conditions` column, upserts the condition by `type`, preserves `lastTransitionTime` if `status` is unchanged, and writes back. Conditions are included in all resource GET responses via `_parse_resource_row()`.
 
+### Authentication and RBAC
+
+All API endpoints except `POST /api/v1/auth/login` and `GET /` require a JWT bearer token.
+
+**Two-tier permission model:**
+
+- **Base role** (`admin` or `viewer`) — carried in the JWT. Admins bypass all permission checks.
+- **Custom role** — a named set of resource-type-scoped CRUD permissions (`CREATE`, `READ`, `UPDATE`, `DELETE`) assigned to a user via `custom_role_id`. Non-admin users need a matching custom role permission to access any resource endpoint.
+
+**Key files:**
+- `src/auth.py` — `AuthManager` (JWT + bcrypt), FastAPI dependency functions (`require_admin`, `require_viewer`, `get_current_user`, `check_resource_permission`), module-level singleton
+- `src/ldap_sync.py` — `LDAPSyncManager`: binds to LDAP, searches for users, upserts into the local users table
+
+**Dependency functions used on routes:**
+
+| Dependency | Used on |
+|---|---|
+| `require_admin` | User CRUD, custom role CRUD, resource type writes, admission webhook writes |
+| `require_viewer` | Resource type reads, admission webhook reads, plugin discovery, global event stream |
+| `get_current_user` + `check_resource_permission` | All resource endpoints (scoped by resource type) |
+
+**Custom role permission matching** (`check_resource_permission` in `src/auth.py`): admins always pass; non-admin users need a permission row whose `resource_type_name` and `resource_type_version` match (or are `*`) and whose `operations` list includes the requested operation.
+
+**LDAP login flow:** at login time the operator binds to the LDAP server with the user's DN and the supplied password rather than checking a stored hash. The LDAP server is the source of truth for credentials. Users must be synced before they can log in.
+
+**Bootstrap:** if `INITIAL_ADMIN_USERNAME` and `INITIAL_ADMIN_PASSWORD` are set and the users table is empty, an admin user is created on startup.
+
+See [`docs/users.md`](docs/users.md) for the full user management and RBAC reference.
+
 ### Drift Detection
 
 Re-reconciliation every 5 minutes for `ready` resources. The reconciler determines if drift occurred and reconciles automatically.
@@ -405,6 +455,8 @@ Reconciliation triggers when `generation > observed_generation`.
 | Admission Webhooks               | HTTP callback webhooks with mutating/validating support         |
 | Phase (`status.phase`)           | `status` enum field (pending/reconciling/ready/failed/deleting) |
 | `metav1.Condition` / `meta.SetStatusCondition()` | `conditions` JSONB array + `db.set_condition()` / `ctx.set_condition()` |
+| RBAC / ClusterRole + ClusterRoleBinding | Custom roles with resource-type-scoped CRUD permissions, assigned via `custom_role_id` |
+| ServiceAccount                   | Users (`manual` or `ldap` source) with JWT bearer tokens        |
 
 ## Monitoring
 
@@ -439,22 +491,8 @@ After every commit run `flake8` and `black .` to ensure codestyle compliance. Cl
 pytest tests/
 ```
 
-### Code Structure
-
-```
-src/
-├── controller.py           # Main loop: event handling, caching, dispatch
-├── db.py                   # PostgreSQL database manager
-├── validation.py           # OpenAPI v3 schema validation
-├── admission.py            # Admission webhook chain
-├── events.py               # EventBus and SSE event streaming
-├── plugins/
-│   ├── inputs/http/        # HTTP Input plugin
-│   ├── actions/github_actions/  # GitHub Actions plugin
-│   └── reconcilers/base.py     # Base class for reconciler plugins
-└── migrations/             # SQL migration files
-tests/                      # Test suite
-```
+### Documentation
+When making changes ensure the documentation in the docs/ folder and this architecture document are updated
 
 ## Developing a Reconciler Plugin
 
@@ -502,15 +540,6 @@ class DatabaseClusterReconciler(ReconcilerPlugin):
         ...
 ```
 
-### Entry Point Registration
-
-```toml
-[project.entry-points.'no8s.reconcilers']
-database_cluster = 'no8s_database:DatabaseClusterReconciler'
-```
-
-After `pip install`, the operator auto-discovers and registers the reconciler at startup via `importlib.metadata.entry_points(group='no8s.reconcilers')`.
-
 ### ReconcilerContext
 
 Passed to each reconciler on startup, providing access to:
@@ -523,9 +552,12 @@ plugin = ctx.get_action_plugin("github_actions")  # Optional action plugin
 
 ## Future Enhancements
 
+- [ ] Create a terraform backend implementation that stores state in the operators postgres database that can be
+      configured through the HTTP Backend in client code
+- [ ] Add OIDC Authentication so both users and services such as GitLab can authenticate securely
+- [ ] Add a git input plugin that triggers reconcilers when repositories are tagged
+- [ ] Consider mechanisms to simplify how this project integrates with IdP's such as Backstage
 - [ ] Multi-controller support with leader election
-- [ ] Roles and authentication
-- [ ] Plan approval workflow
 - [ ] Prometheus metrics
 - [ ] GitOps integration (watch Git repos for changes)
 - [ ] Policy enforcement (OPA integration)

@@ -292,6 +292,7 @@ class TestConfig:
             "RECONCILE_INTERVAL": "30",
             "API_PORT": "9000",
             "ENABLED_ACTION_PLUGINS": "github_actions",
+            "JWT_SECRET_KEY": "test-jwt-secret-key-32-chars-long",
         }
         with patch.dict(os.environ, env_vars, clear=False):
             cfg = Config.from_env()
@@ -317,6 +318,7 @@ class TestConfigSingleton:
         """Test load_config function."""
         env_vars = {
             "DB_PASSWORD": "testpass",
+            "JWT_SECRET_KEY": "test-jwt-secret-key-32-chars-long",
         }
         with patch.dict(os.environ, env_vars, clear=False):
             cfg = load_config()
@@ -327,6 +329,7 @@ class TestConfigSingleton:
         """Test get_config loads config if not loaded."""
         env_vars = {
             "DB_PASSWORD": "testpass",
+            "JWT_SECRET_KEY": "test-jwt-secret-key-32-chars-long",
         }
         with patch.dict(os.environ, env_vars, clear=False):
             cfg = get_config()
@@ -337,6 +340,7 @@ class TestConfigSingleton:
         """Test that singleton returns same instance."""
         env_vars = {
             "DB_PASSWORD": "testpass",
+            "JWT_SECRET_KEY": "test-jwt-secret-key-32-chars-long",
         }
         with patch.dict(os.environ, env_vars, clear=False):
             cfg1 = load_config()
@@ -347,6 +351,7 @@ class TestConfigSingleton:
         """Test reset_config clears the singleton."""
         env_vars = {
             "DB_PASSWORD": "testpass",
+            "JWT_SECRET_KEY": "test-jwt-secret-key-32-chars-long",
         }
         with patch.dict(os.environ, env_vars, clear=False):
             cfg1 = load_config()

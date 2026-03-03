@@ -11,12 +11,19 @@ import logging
 import os
 import re
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
+
+from auth import (
+    check_resource_permission,
+    check_system_permission,
+    get_current_user,
+    require_admin,
+)
 
 from admission import AdmissionChain, AdmissionError, AdmissionRequest
 from events import EventBus, EventType, ResourceEvent
@@ -365,6 +372,148 @@ class PluginInfo(BaseModel):
     version: str
 
 
+# Auth models
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class LoginResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    username: str
+    is_admin: bool
+
+
+# User management models
+
+
+class UserCreate(BaseModel):
+    username: str
+    password: str = Field(..., min_length=8)
+    email: Optional[str] = None
+    display_name: Optional[str] = None
+    is_admin: bool = False
+    custom_role_id: Optional[int] = None
+
+    @field_validator("username")
+    @classmethod
+    def validate_username(cls, v: str) -> str:
+        return validate_name_format(v, "username")
+
+
+class UserUpdate(BaseModel):
+    email: Optional[str] = None
+    display_name: Optional[str] = None
+    is_admin: Optional[bool] = None
+    status: Optional[Literal["active", "suspended"]] = None
+    custom_role_id: Optional[int] = None
+
+
+class UserResponse(BaseModel):
+    id: int
+    username: str
+    email: Optional[str] = None
+    display_name: Optional[str] = None
+    source: str
+    is_admin: bool
+    status: str
+    created_at: datetime
+    updated_at: datetime
+    last_login_at: Optional[datetime] = None
+    last_synced_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class LDAPSyncResponse(BaseModel):
+    created: int
+    updated: int
+    total: int
+
+
+# Custom role models
+
+_CRUD_OPS = Literal["CREATE", "READ", "UPDATE", "DELETE"]
+
+
+class RolePermissionCreate(BaseModel):
+    resource_type_name: str = "*"
+    resource_type_version: str = "*"
+    operations: List[_CRUD_OPS] = ["CREATE", "READ", "UPDATE", "DELETE"]
+
+
+class RolePermissionUpdate(BaseModel):
+    operations: List[_CRUD_OPS]
+
+
+class RolePermissionResponse(BaseModel):
+    id: int
+    role_id: int
+    resource_type_name: str
+    resource_type_version: str
+    operations: List[str]
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+_VALID_SYSTEM_PERMISSIONS = {"view_webhooks", "view_plugins"}
+
+
+class CustomRoleCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    system_permissions: List[str] = []
+    permissions: List[RolePermissionCreate] = []
+
+    @field_validator("system_permissions")
+    @classmethod
+    def validate_system_permissions(cls, v: List[str]) -> List[str]:
+        unknown = set(v) - _VALID_SYSTEM_PERMISSIONS
+        if unknown:
+            raise ValueError(
+                f"Unknown system_permissions: {unknown}. "
+                f"Valid values: {_VALID_SYSTEM_PERMISSIONS}"
+            )
+        return v
+
+
+class CustomRoleUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    system_permissions: Optional[List[str]] = None
+
+    @field_validator("system_permissions")
+    @classmethod
+    def validate_system_permissions(cls, v: Optional[List[str]]) -> Optional[List[str]]:
+        if v is not None:
+            unknown = set(v) - _VALID_SYSTEM_PERMISSIONS
+            if unknown:
+                raise ValueError(
+                    f"Unknown system_permissions: {unknown}. "
+                    f"Valid values: {_VALID_SYSTEM_PERMISSIONS}"
+                )
+        return v
+
+
+class CustomRoleResponse(BaseModel):
+    id: int
+    name: str
+    description: Optional[str] = None
+    system_permissions: List[str] = []
+    permissions: List[RolePermissionResponse] = []
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
 class HTTPInputPlugin(InputPlugin):
     """
     Input plugin that provides a REST API for resource management.
@@ -381,6 +530,8 @@ class HTTPInputPlugin(InputPlugin):
         self._db_manager = None
         self._admission_chain: Optional[AdmissionChain] = None
         self._event_bus: Optional[EventBus] = None
+        self._auth_manager = None
+        self._ldap_manager = None
         self._config: Dict[str, Any] = {}
 
     @property
@@ -423,6 +574,14 @@ class HTTPInputPlugin(InputPlugin):
         """Set the event bus instance for publishing and streaming events."""
         self._event_bus = event_bus
 
+    def set_auth_manager(self, auth_manager) -> None:
+        """Set the authentication manager."""
+        self._auth_manager = auth_manager
+
+    def set_ldap_manager(self, ldap_manager) -> None:
+        """Set the LDAP sync manager."""
+        self._ldap_manager = ldap_manager
+
     def _setup_routes(self) -> None:
         """
         Set up all FastAPI routes for the REST API.
@@ -448,6 +607,347 @@ class HTTPInputPlugin(InputPlugin):
             """Health check endpoint."""
             return {"status": "ok", "service": "infrastructure-controller"}
 
+        # ==================== Auth Endpoints ====================
+
+        @self.app.post("/api/v1/auth/login", response_model=LoginResponse)
+        async def login(body: LoginRequest):
+            """Issue a JWT for valid credentials."""
+            if not self._db_manager:
+                raise HTTPException(status_code=503, detail="Database not available")
+            if not self._auth_manager:
+                raise HTTPException(status_code=503, detail="Auth not configured")
+
+            user = await self._db_manager.get_user_by_username(body.username)
+            if not user or user.get("status") != "active":
+                raise HTTPException(status_code=401, detail="Invalid credentials")
+
+            if user["source"] == "manual":
+                if not user.get(
+                    "password_hash"
+                ) or not self._auth_manager.verify_password(
+                    body.password, user["password_hash"]
+                ):
+                    raise HTTPException(status_code=401, detail="Invalid credentials")
+            else:
+                # LDAP user — bind against directory
+                if not self._ldap_manager or not self._ldap_manager.authenticate(
+                    user["ldap_dn"], body.password
+                ):
+                    raise HTTPException(status_code=401, detail="Invalid credentials")
+
+            await self._db_manager.update_user_last_login(user["id"])
+            token = self._auth_manager.create_token(user)
+            return LoginResponse(
+                access_token=token,
+                username=user["username"],
+                is_admin=bool(user.get("is_admin", False)),
+            )
+
+        @self.app.get("/api/v1/auth/me", response_model=UserResponse)
+        async def auth_me(current_user: dict = Depends(get_current_user)):
+            """Return the currently authenticated user."""
+            if not self._db_manager:
+                raise HTTPException(status_code=503, detail="Database not available")
+            user = await self._db_manager.get_user(int(current_user["sub"]))
+            if not user:
+                raise HTTPException(status_code=404, detail="User not found")
+            return UserResponse(**user)
+
+        # ==================== User Management Endpoints ====================
+
+        @self.app.post("/api/v1/users", response_model=UserResponse, status_code=201)
+        async def create_user(body: UserCreate, _: dict = Depends(require_admin)):
+            """Create a new manual user (admin only)."""
+            if not self._db_manager:
+                raise HTTPException(status_code=503, detail="Database not available")
+            if not self._auth_manager:
+                raise HTTPException(status_code=503, detail="Auth not configured")
+
+            try:
+                pw_hash = self._auth_manager.hash_password(body.password)
+                user = await self._db_manager.create_user(
+                    username=body.username,
+                    is_admin=body.is_admin,
+                    password_hash=pw_hash,
+                    email=body.email,
+                    display_name=body.display_name,
+                    source="manual",
+                )
+                return UserResponse(**user)
+            except Exception as e:
+                if "unique constraint" in str(e).lower():
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"User '{body.username}' already exists",
+                    )
+                logger.error(f"Error creating user: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.get("/api/v1/users", response_model=List[UserResponse])
+        async def list_users(
+            source: Optional[str] = None,
+            is_admin: Optional[bool] = None,
+            status: Optional[str] = None,
+            limit: int = 100,
+            _: dict = Depends(require_admin),
+        ):
+            """List users with optional filters (admin only)."""
+            if not self._db_manager:
+                raise HTTPException(status_code=503, detail="Database not available")
+
+            try:
+                users = await self._db_manager.list_users(
+                    source=source, is_admin=is_admin, status=status, limit=limit
+                )
+                return [UserResponse(**u) for u in users]
+            except Exception as e:
+                logger.error(f"Error listing users: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.get("/api/v1/users/{user_id}", response_model=UserResponse)
+        async def get_user(user_id: int, _: dict = Depends(require_admin)):
+            """Get a user by ID (admin only)."""
+            if not self._db_manager:
+                raise HTTPException(status_code=503, detail="Database not available")
+
+            user = await self._db_manager.get_user(user_id)
+            if not user:
+                raise HTTPException(status_code=404, detail="User not found")
+            return UserResponse(**user)
+
+        @self.app.put("/api/v1/users/{user_id}", response_model=UserResponse)
+        async def update_user(
+            user_id: int, body: UserUpdate, _: dict = Depends(require_admin)
+        ):
+            """Update a user (admin only)."""
+            if not self._db_manager:
+                raise HTTPException(status_code=503, detail="Database not available")
+
+            try:
+                user = await self._db_manager.update_user(
+                    user_id,
+                    email=body.email,
+                    display_name=body.display_name,
+                    is_admin=body.is_admin,
+                    status=body.status,
+                    custom_role_id=body.custom_role_id,
+                )
+                if not user:
+                    raise HTTPException(status_code=404, detail="User not found")
+                return UserResponse(**user)
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.error(f"Error updating user: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.delete("/api/v1/users/{user_id}", status_code=204)
+        async def delete_user(user_id: int, _: dict = Depends(require_admin)):
+            """Suspend a user (admin only)."""
+            if not self._db_manager:
+                raise HTTPException(status_code=503, detail="Database not available")
+
+            deleted = await self._db_manager.delete_user(user_id)
+            if not deleted:
+                raise HTTPException(status_code=404, detail="User not found")
+            return None
+
+        @self.app.post("/api/v1/users/ldap-sync", response_model=LDAPSyncResponse)
+        async def ldap_sync(_: dict = Depends(require_admin)):
+            """Trigger an LDAP sync (admin only)."""
+            if not self._db_manager:
+                raise HTTPException(status_code=503, detail="Database not available")
+            if not self._ldap_manager or not self._ldap_manager.is_configured():
+                raise HTTPException(status_code=503, detail="LDAP is not configured")
+
+            try:
+                stats = await self._ldap_manager.sync_to_db(self._db_manager)
+                return LDAPSyncResponse(**stats)
+            except Exception as e:
+                logger.error(f"Error during LDAP sync: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        # ==================== Custom Role Endpoints ====================
+
+        @self.app.post(
+            "/api/v1/custom-roles",
+            response_model=CustomRoleResponse,
+            status_code=201,
+        )
+        async def create_custom_role(
+            body: CustomRoleCreate, _: dict = Depends(require_admin)
+        ):
+            """Create a custom role (admin only)."""
+            if not self._db_manager:
+                raise HTTPException(status_code=503, detail="Database not available")
+
+            try:
+                role = await self._db_manager.create_custom_role(
+                    name=body.name,
+                    description=body.description,
+                    system_permissions=body.system_permissions,
+                )
+                for perm in body.permissions:
+                    p = await self._db_manager.add_role_permission(
+                        role_id=role["id"],
+                        resource_type_name=perm.resource_type_name,
+                        resource_type_version=perm.resource_type_version,
+                        operations=list(perm.operations),
+                    )
+                    role["permissions"].append(p)
+                return CustomRoleResponse(**role)
+            except Exception as e:
+                if "unique constraint" in str(e).lower():
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Role '{body.name}' already exists",
+                    )
+                logger.error(f"Error creating custom role: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.get("/api/v1/custom-roles", response_model=List[CustomRoleResponse])
+        async def list_custom_roles(_: dict = Depends(require_admin)):
+            """List custom roles (admin only)."""
+            if not self._db_manager:
+                raise HTTPException(status_code=503, detail="Database not available")
+
+            try:
+                roles = await self._db_manager.list_custom_roles()
+                return [CustomRoleResponse(**r) for r in roles]
+            except Exception as e:
+                logger.error(f"Error listing custom roles: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.get(
+            "/api/v1/custom-roles/{role_id}", response_model=CustomRoleResponse
+        )
+        async def get_custom_role(role_id: int, _: dict = Depends(require_admin)):
+            """Get a custom role by ID (admin only)."""
+            if not self._db_manager:
+                raise HTTPException(status_code=503, detail="Database not available")
+
+            role = await self._db_manager.get_custom_role(role_id)
+            if not role:
+                raise HTTPException(status_code=404, detail="Role not found")
+            return CustomRoleResponse(**role)
+
+        @self.app.put(
+            "/api/v1/custom-roles/{role_id}", response_model=CustomRoleResponse
+        )
+        async def update_custom_role(
+            role_id: int, body: CustomRoleUpdate, _: dict = Depends(require_admin)
+        ):
+            """Update a custom role's name/description (admin only)."""
+            if not self._db_manager:
+                raise HTTPException(status_code=503, detail="Database not available")
+
+            try:
+                role = await self._db_manager.update_custom_role(
+                    role_id,
+                    name=body.name,
+                    description=body.description,
+                    system_permissions=body.system_permissions,
+                )
+                if not role:
+                    raise HTTPException(status_code=404, detail="Role not found")
+                return CustomRoleResponse(**role)
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.error(f"Error updating custom role: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.delete("/api/v1/custom-roles/{role_id}", status_code=204)
+        async def delete_custom_role(role_id: int, _: dict = Depends(require_admin)):
+            """Delete a custom role (admin only)."""
+            if not self._db_manager:
+                raise HTTPException(status_code=503, detail="Database not available")
+
+            deleted = await self._db_manager.delete_custom_role(role_id)
+            if not deleted:
+                raise HTTPException(status_code=404, detail="Role not found")
+            return None
+
+        @self.app.post(
+            "/api/v1/custom-roles/{role_id}/permissions",
+            response_model=RolePermissionResponse,
+            status_code=201,
+        )
+        async def add_role_permission(
+            role_id: int,
+            body: RolePermissionCreate,
+            _: dict = Depends(require_admin),
+        ):
+            """Add a permission to a custom role (admin only)."""
+            if not self._db_manager:
+                raise HTTPException(status_code=503, detail="Database not available")
+
+            role = await self._db_manager.get_custom_role(role_id)
+            if not role:
+                raise HTTPException(status_code=404, detail="Role not found")
+
+            try:
+                perm = await self._db_manager.add_role_permission(
+                    role_id=role_id,
+                    resource_type_name=body.resource_type_name,
+                    resource_type_version=body.resource_type_version,
+                    operations=list(body.operations),
+                )
+                return RolePermissionResponse(**perm)
+            except Exception as e:
+                if "unique constraint" in str(e).lower():
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Permission for this resource type/version already exists",
+                    )
+                logger.error(f"Error adding role permission: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.put(
+            "/api/v1/custom-roles/{role_id}/permissions/{perm_id}",
+            response_model=RolePermissionResponse,
+        )
+        async def update_role_permission(
+            role_id: int,
+            perm_id: int,
+            body: RolePermissionUpdate,
+            _: dict = Depends(require_admin),
+        ):
+            """Update a permission's operations (admin only)."""
+            if not self._db_manager:
+                raise HTTPException(status_code=503, detail="Database not available")
+
+            try:
+                perm = await self._db_manager.update_role_permission(
+                    perm_id, operations=list(body.operations)
+                )
+                if not perm:
+                    raise HTTPException(status_code=404, detail="Permission not found")
+                return RolePermissionResponse(**perm)
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.error(f"Error updating role permission: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.delete(
+            "/api/v1/custom-roles/{role_id}/permissions/{perm_id}",
+            status_code=204,
+        )
+        async def delete_role_permission(
+            role_id: int,
+            perm_id: int,
+            _: dict = Depends(require_admin),
+        ):
+            """Remove a permission from a custom role (admin only)."""
+            if not self._db_manager:
+                raise HTTPException(status_code=503, detail="Database not available")
+
+            deleted = await self._db_manager.delete_role_permission(perm_id)
+            if not deleted:
+                raise HTTPException(status_code=404, detail="Permission not found")
+            return None
+
         # ==================== Resource Type Endpoints ====================
 
         @self.app.post(
@@ -455,7 +955,9 @@ class HTTPInputPlugin(InputPlugin):
             response_model=ResourceTypeResponse,
             status_code=201,
         )
-        async def create_resource_type(rt: ResourceTypeCreate):
+        async def create_resource_type(
+            rt: ResourceTypeCreate, _: dict = Depends(require_admin)
+        ):
             """Create a new resource type."""
             if not self._db_manager:
                 raise HTTPException(status_code=503, detail="Database not available")
@@ -486,6 +988,7 @@ class HTTPInputPlugin(InputPlugin):
             name: Optional[str] = None,
             status: Optional[str] = None,
             limit: int = 100,
+            _: dict = Depends(get_current_user),
         ):
             """List resource types with optional filters."""
             if not self._db_manager:
@@ -504,7 +1007,9 @@ class HTTPInputPlugin(InputPlugin):
             "/api/v1/resource-types/{resource_type_id}",
             response_model=ResourceTypeResponse,
         )
-        async def get_resource_type_by_id(resource_type_id: int):
+        async def get_resource_type_by_id(
+            resource_type_id: int, _: dict = Depends(get_current_user)
+        ):
             """Get a resource type by ID."""
             if not self._db_manager:
                 raise HTTPException(status_code=503, detail="Database not available")
@@ -526,7 +1031,9 @@ class HTTPInputPlugin(InputPlugin):
             "/api/v1/resource-types/{name}/{version}",
             response_model=ResourceTypeResponse,
         )
-        async def get_resource_type_by_name_version(name: str, version: str):
+        async def get_resource_type_by_name_version(
+            name: str, version: str, _: dict = Depends(get_current_user)
+        ):
             """Get a resource type by name and version."""
             if not self._db_manager:
                 raise HTTPException(status_code=503, detail="Database not available")
@@ -551,7 +1058,9 @@ class HTTPInputPlugin(InputPlugin):
             response_model=ResourceTypeResponse,
         )
         async def update_resource_type(
-            resource_type_id: int, update: ResourceTypeUpdate
+            resource_type_id: int,
+            update: ResourceTypeUpdate,
+            _: dict = Depends(require_admin),
         ):
             """Update a resource type."""
             if not self._db_manager:
@@ -578,7 +1087,9 @@ class HTTPInputPlugin(InputPlugin):
                 raise HTTPException(status_code=500, detail=str(e))
 
         @self.app.delete("/api/v1/resource-types/{resource_type_id}", status_code=204)
-        async def delete_resource_type(resource_type_id: int):
+        async def delete_resource_type(
+            resource_type_id: int, _: dict = Depends(require_admin)
+        ):
             """Delete a resource type (fails if resources still reference it)."""
             if not self._db_manager:
                 raise HTTPException(status_code=503, detail="Database not available")
@@ -602,10 +1113,23 @@ class HTTPInputPlugin(InputPlugin):
         @self.app.post(
             "/api/v1/resources", response_model=ResourceResponse, status_code=201
         )
-        async def create_resource(resource: ResourceCreate):
+        async def create_resource(
+            resource: ResourceCreate,
+            current_user: dict = Depends(get_current_user),
+        ):
             """Create a new resource."""
             if not self._db_manager:
                 raise HTTPException(status_code=503, detail="Database not available")
+
+            allowed = await check_resource_permission(
+                current_user,
+                self._db_manager,
+                resource.resource_type_name,
+                resource.resource_type_version,
+                "CREATE",
+            )
+            if not allowed:
+                raise HTTPException(status_code=403, detail="Insufficient permissions")
 
             from plugins.registry import get_registry
 
@@ -728,6 +1252,7 @@ class HTTPInputPlugin(InputPlugin):
         async def list_resources(
             status: Optional[str] = None,
             action_plugin: Optional[str] = None,
+            current_user: dict = Depends(get_current_user),
             limit: int = 100,
         ):
             """List all resources with optional filters."""
@@ -740,6 +1265,18 @@ class HTTPInputPlugin(InputPlugin):
                     action_plugin=action_plugin,
                     limit=limit,
                 )
+                if current_user.get("role") != "admin":
+                    filtered = []
+                    for r in resources:
+                        if await check_resource_permission(
+                            current_user,
+                            self._db_manager,
+                            r["resource_type_name"],
+                            r["resource_type_version"],
+                            "READ",
+                        ):
+                            filtered.append(r)
+                    resources = filtered
                 return [ResourceResponse(**r) for r in resources]
             except Exception as e:
                 logger.error(f"Error listing resources: {e}")
@@ -748,7 +1285,10 @@ class HTTPInputPlugin(InputPlugin):
         @self.app.get(
             "/api/v1/resources/{resource_id}", response_model=ResourceResponse
         )
-        async def get_resource_by_id(resource_id: int):
+        async def get_resource_by_id(
+            resource_id: int,
+            current_user: dict = Depends(get_current_user),
+        ):
             """Get a resource by ID."""
             if not self._db_manager:
                 raise HTTPException(status_code=503, detail="Database not available")
@@ -757,6 +1297,17 @@ class HTTPInputPlugin(InputPlugin):
                 resource = await self._db_manager.get_resource(resource_id)
                 if not resource:
                     raise HTTPException(status_code=404, detail="Resource not found")
+                allowed = await check_resource_permission(
+                    current_user,
+                    self._db_manager,
+                    resource["resource_type_name"],
+                    resource["resource_type_version"],
+                    "READ",
+                )
+                if not allowed:
+                    raise HTTPException(
+                        status_code=403, detail="Insufficient permissions"
+                    )
                 return ResourceResponse(**resource)
             except HTTPException:
                 raise
@@ -769,11 +1320,24 @@ class HTTPInputPlugin(InputPlugin):
             response_model=ResourceResponse,
         )
         async def get_resource_by_name(
-            resource_type_name: str, resource_type_version: str, name: str
+            resource_type_name: str,
+            resource_type_version: str,
+            name: str,
+            current_user: dict = Depends(get_current_user),
         ):
             """Get a resource by resource type and name."""
             if not self._db_manager:
                 raise HTTPException(status_code=503, detail="Database not available")
+
+            allowed = await check_resource_permission(
+                current_user,
+                self._db_manager,
+                resource_type_name,
+                resource_type_version,
+                "READ",
+            )
+            if not allowed:
+                raise HTTPException(status_code=403, detail="Insufficient permissions")
 
             try:
                 resource = await self._db_manager.get_resource_by_name(
@@ -791,7 +1355,11 @@ class HTTPInputPlugin(InputPlugin):
         @self.app.put(
             "/api/v1/resources/{resource_id}", response_model=ResourceResponse
         )
-        async def update_resource(resource_id: int, update: ResourceUpdate):
+        async def update_resource(
+            resource_id: int,
+            update: ResourceUpdate,
+            current_user: dict = Depends(get_current_user),
+        ):
             """Update a resource's specification."""
             if not self._db_manager:
                 raise HTTPException(status_code=503, detail="Database not available")
@@ -801,6 +1369,18 @@ class HTTPInputPlugin(InputPlugin):
                 current = await self._db_manager.get_resource(resource_id)
                 if not current:
                     raise HTTPException(status_code=404, detail="Resource not found")
+
+                allowed = await check_resource_permission(
+                    current_user,
+                    self._db_manager,
+                    current["resource_type_name"],
+                    current["resource_type_version"],
+                    "UPDATE",
+                )
+                if not allowed:
+                    raise HTTPException(
+                        status_code=403, detail="Insufficient permissions"
+                    )
 
                 # If spec is being updated, validate against schema
                 spec_to_use = update.spec
@@ -870,7 +1450,10 @@ class HTTPInputPlugin(InputPlugin):
                 raise HTTPException(status_code=500, detail=str(e))
 
         @self.app.delete("/api/v1/resources/{resource_id}", status_code=202)
-        async def delete_resource(resource_id: int):
+        async def delete_resource(
+            resource_id: int,
+            current_user: dict = Depends(get_current_user),
+        ):
             """Delete a resource (triggers destroy)."""
             if not self._db_manager:
                 raise HTTPException(status_code=503, detail="Database not available")
@@ -879,6 +1462,18 @@ class HTTPInputPlugin(InputPlugin):
                 resource = await self._db_manager.get_resource(resource_id)
                 if not resource:
                     raise HTTPException(status_code=404, detail="Resource not found")
+
+                allowed = await check_resource_permission(
+                    current_user,
+                    self._db_manager,
+                    resource["resource_type_name"],
+                    resource["resource_type_version"],
+                    "DELETE",
+                )
+                if not allowed:
+                    raise HTTPException(
+                        status_code=403, detail="Insufficient permissions"
+                    )
 
                 # Run admission webhooks
                 if self._admission_chain:
@@ -926,7 +1521,11 @@ class HTTPInputPlugin(InputPlugin):
                 raise HTTPException(status_code=500, detail=str(e))
 
         @self.app.put("/api/v1/resources/{resource_id}/finalizers")
-        async def update_finalizers(resource_id: int, update: FinalizersUpdate):
+        async def update_finalizers(
+            resource_id: int,
+            update: FinalizersUpdate,
+            current_user: dict = Depends(get_current_user),
+        ):
             """Add or remove finalizers from a resource."""
             if not self._db_manager:
                 raise HTTPException(status_code=503, detail="Database not available")
@@ -935,6 +1534,18 @@ class HTTPInputPlugin(InputPlugin):
                 resource = await self._db_manager.get_resource(resource_id)
                 if not resource:
                     raise HTTPException(status_code=404, detail="Resource not found")
+
+                allowed = await check_resource_permission(
+                    current_user,
+                    self._db_manager,
+                    resource["resource_type_name"],
+                    resource["resource_type_version"],
+                    "UPDATE",
+                )
+                if not allowed:
+                    raise HTTPException(
+                        status_code=403, detail="Insufficient permissions"
+                    )
 
                 for finalizer in update.add:
                     await self._db_manager.add_finalizer(resource_id, finalizer)
@@ -963,17 +1574,36 @@ class HTTPInputPlugin(InputPlugin):
                 raise HTTPException(status_code=500, detail=str(e))
 
         @self.app.post("/api/v1/resources/{resource_id}/reconcile", status_code=202)
-        async def trigger_reconciliation(resource_id: int):
+        async def trigger_reconciliation(
+            resource_id: int,
+            current_user: dict = Depends(get_current_user),
+        ):
             """Manually trigger reconciliation for a resource."""
             if not self._db_manager:
                 raise HTTPException(status_code=503, detail="Database not available")
 
             try:
+                resource = await self._db_manager.get_resource(resource_id)
+                if not resource:
+                    raise HTTPException(status_code=404, detail="Resource not found")
+                allowed = await check_resource_permission(
+                    current_user,
+                    self._db_manager,
+                    resource["resource_type_name"],
+                    resource["resource_type_version"],
+                    "UPDATE",
+                )
+                if not allowed:
+                    raise HTTPException(
+                        status_code=403, detail="Insufficient permissions"
+                    )
                 await self._db_manager.mark_resource_for_reconciliation(resource_id)
                 return {
                     "message": "Reconciliation triggered",
                     "resource_id": resource_id,
                 }
+            except HTTPException:
+                raise
             except Exception as e:
                 logger.error(f"Error triggering reconciliation: {e}")
                 raise HTTPException(status_code=500, detail=str(e))
@@ -982,22 +1612,45 @@ class HTTPInputPlugin(InputPlugin):
             "/api/v1/resources/{resource_id}/history",
             response_model=List[ReconciliationHistoryResponse],
         )
-        async def get_reconciliation_history(resource_id: int, limit: int = 10):
+        async def get_reconciliation_history(
+            resource_id: int,
+            limit: int = 10,
+            current_user: dict = Depends(get_current_user),
+        ):
             """Get reconciliation history for a resource."""
             if not self._db_manager:
                 raise HTTPException(status_code=503, detail="Database not available")
 
             try:
+                resource = await self._db_manager.get_resource(resource_id)
+                if not resource:
+                    raise HTTPException(status_code=404, detail="Resource not found")
+                allowed = await check_resource_permission(
+                    current_user,
+                    self._db_manager,
+                    resource["resource_type_name"],
+                    resource["resource_type_version"],
+                    "READ",
+                )
+                if not allowed:
+                    raise HTTPException(
+                        status_code=403, detail="Insufficient permissions"
+                    )
                 history = await self._db_manager.get_reconciliation_history(
                     resource_id, limit
                 )
                 return [ReconciliationHistoryResponse(**record) for record in history]
+            except HTTPException:
+                raise
             except Exception as e:
                 logger.error(f"Error getting reconciliation history: {e}")
                 raise HTTPException(status_code=500, detail=str(e))
 
         @self.app.get("/api/v1/resources/{resource_id}/outputs")
-        async def get_resource_outputs(resource_id: int):
+        async def get_resource_outputs(
+            resource_id: int,
+            current_user: dict = Depends(get_current_user),
+        ):
             """Get action outputs for a resource."""
             if not self._db_manager:
                 raise HTTPException(status_code=503, detail="Database not available")
@@ -1006,6 +1659,18 @@ class HTTPInputPlugin(InputPlugin):
                 resource = await self._db_manager.get_resource(resource_id)
                 if not resource:
                     raise HTTPException(status_code=404, detail="Resource not found")
+
+                allowed = await check_resource_permission(
+                    current_user,
+                    self._db_manager,
+                    resource["resource_type_name"],
+                    resource["resource_type_version"],
+                    "READ",
+                )
+                if not allowed:
+                    raise HTTPException(
+                        status_code=403, detail="Insufficient permissions"
+                    )
 
                 return {"outputs": resource.get("outputs", {})}
 
@@ -1017,8 +1682,15 @@ class HTTPInputPlugin(InputPlugin):
 
         # Plugin discovery endpoints
         @self.app.get("/api/v1/plugins/actions", response_model=List[PluginInfo])
-        async def list_action_plugins():
-            """List available action plugins."""
+        async def list_action_plugins(current_user: dict = Depends(get_current_user)):
+            """List available action plugins (requires view_plugins permission)."""
+            if not self._db_manager:
+                raise HTTPException(status_code=503, detail="Database not available")
+            allowed = await check_system_permission(
+                current_user, self._db_manager, "view_plugins"
+            )
+            if not allowed:
+                raise HTTPException(status_code=403, detail="Insufficient permissions")
             from plugins.registry import get_registry
 
             registry = get_registry()
@@ -1030,8 +1702,15 @@ class HTTPInputPlugin(InputPlugin):
             return plugins
 
         @self.app.get("/api/v1/plugins/inputs", response_model=List[PluginInfo])
-        async def list_input_plugins():
-            """List available input plugins."""
+        async def list_input_plugins(current_user: dict = Depends(get_current_user)):
+            """List available input plugins (requires view_plugins permission)."""
+            if not self._db_manager:
+                raise HTTPException(status_code=503, detail="Database not available")
+            allowed = await check_system_permission(
+                current_user, self._db_manager, "view_plugins"
+            )
+            if not allowed:
+                raise HTTPException(status_code=403, detail="Insufficient permissions")
             from plugins.registry import get_registry
 
             registry = get_registry()
@@ -1049,7 +1728,9 @@ class HTTPInputPlugin(InputPlugin):
             response_model=AdmissionWebhookResponse,
             status_code=201,
         )
-        async def create_admission_webhook(webhook: AdmissionWebhookCreate):
+        async def create_admission_webhook(
+            webhook: AdmissionWebhookCreate, _: dict = Depends(require_admin)
+        ):
             """Register an admission webhook."""
             if not self._db_manager:
                 raise HTTPException(status_code=503, detail="Database not available")
@@ -1085,10 +1766,16 @@ class HTTPInputPlugin(InputPlugin):
             resource_type_name: Optional[str] = None,
             resource_type_version: Optional[str] = None,
             webhook_type: Optional[str] = None,
+            current_user: dict = Depends(get_current_user),
         ):
-            """List admission webhooks."""
+            """List admission webhooks (requires view_webhooks permission)."""
             if not self._db_manager:
                 raise HTTPException(status_code=503, detail="Database not available")
+            allowed = await check_system_permission(
+                current_user, self._db_manager, "view_webhooks"
+            )
+            if not allowed:
+                raise HTTPException(status_code=403, detail="Insufficient permissions")
 
             try:
                 webhooks = await self._db_manager.list_admission_webhooks(
@@ -1105,10 +1792,17 @@ class HTTPInputPlugin(InputPlugin):
             "/api/v1/admission-webhooks/{webhook_id}",
             response_model=AdmissionWebhookResponse,
         )
-        async def get_admission_webhook(webhook_id: int):
-            """Get an admission webhook by ID."""
+        async def get_admission_webhook(
+            webhook_id: int, current_user: dict = Depends(get_current_user)
+        ):
+            """Get an admission webhook by ID (requires view_webhooks permission)."""
             if not self._db_manager:
                 raise HTTPException(status_code=503, detail="Database not available")
+            allowed = await check_system_permission(
+                current_user, self._db_manager, "view_webhooks"
+            )
+            if not allowed:
+                raise HTTPException(status_code=403, detail="Insufficient permissions")
 
             try:
                 webhook = await self._db_manager.get_admission_webhook(webhook_id)
@@ -1129,7 +1823,9 @@ class HTTPInputPlugin(InputPlugin):
             response_model=AdmissionWebhookResponse,
         )
         async def update_admission_webhook(
-            webhook_id: int, update: AdmissionWebhookUpdate
+            webhook_id: int,
+            update: AdmissionWebhookUpdate,
+            _: dict = Depends(require_admin),
         ):
             """Update an admission webhook."""
             if not self._db_manager:
@@ -1161,7 +1857,9 @@ class HTTPInputPlugin(InputPlugin):
                 raise HTTPException(status_code=500, detail=str(e))
 
         @self.app.delete("/api/v1/admission-webhooks/{webhook_id}", status_code=204)
-        async def delete_admission_webhook(webhook_id: int):
+        async def delete_admission_webhook(
+            webhook_id: int, _: dict = Depends(require_admin)
+        ):
             """Delete an admission webhook."""
             if not self._db_manager:
                 raise HTTPException(status_code=503, detail="Database not available")
@@ -1183,9 +1881,14 @@ class HTTPInputPlugin(InputPlugin):
         # ==================== Event Streaming Endpoints ====================
 
         @self.app.get("/api/v1/events")
-        async def stream_all_events(resource_type: Optional[str] = None):
+        async def stream_all_events(
+            resource_type: Optional[str] = None,
+            current_user: dict = Depends(get_current_user),
+        ):
             """SSE stream of all resource events.
 
+            Admins see all events. Non-admins see only events for resource
+            types they have READ permission on via their custom role.
             Optionally filter by resource type name.
             """
             if not self._event_bus:
@@ -1194,14 +1897,49 @@ class HTTPInputPlugin(InputPlugin):
                     detail="Event streaming not available",
                 )
 
-            if resource_type:
-                rt_name = resource_type
+            if current_user.get("is_admin"):
+                # Admins: apply only the optional resource_type filter
+                if resource_type:
+                    rt_name = resource_type
 
-                def filter_fn(event: ResourceEvent) -> bool:
-                    return event.resource_type_name == rt_name
+                    def filter_fn(event: ResourceEvent) -> bool:
+                        return event.resource_type_name == rt_name
 
+                else:
+                    filter_fn = None
             else:
-                filter_fn = None
+                # Non-admins: filter by allowed resource types from custom role
+                custom_role_id = current_user.get("custom_role_id")
+                if custom_role_id and self._db_manager:
+                    perms = await self._db_manager.get_custom_role_permissions(
+                        custom_role_id
+                    )
+                    wildcard = any(
+                        p["resource_type_name"] == "*" and "READ" in p["operations"]
+                        for p in perms
+                    )
+                    if wildcard:
+                        allowed_types: Optional[set] = None  # all types allowed
+                    else:
+                        allowed_types = {
+                            p["resource_type_name"]
+                            for p in perms
+                            if "READ" in p["operations"]
+                        }
+                else:
+                    allowed_types = set()  # no permissions → empty stream
+
+                rt_filter = resource_type
+
+                def filter_fn(event: ResourceEvent) -> bool:  # type: ignore[misc]
+                    if (
+                        allowed_types is not None
+                        and event.resource_type_name not in allowed_types
+                    ):
+                        return False
+                    if rt_filter and event.resource_type_name != rt_filter:
+                        return False
+                    return True
 
             subscriber_id, subscription = await self._event_bus.subscribe(filter_fn)
 
@@ -1224,7 +1962,10 @@ class HTTPInputPlugin(InputPlugin):
             )
 
         @self.app.get("/api/v1/resources/{resource_id}/events")
-        async def stream_resource_events(resource_id: int):
+        async def stream_resource_events(
+            resource_id: int,
+            current_user: dict = Depends(get_current_user),
+        ):
             """SSE stream for a specific resource."""
             if not self._db_manager:
                 raise HTTPException(status_code=503, detail="Database not available")
@@ -1237,6 +1978,16 @@ class HTTPInputPlugin(InputPlugin):
             resource = await self._db_manager.get_resource(resource_id)
             if not resource:
                 raise HTTPException(status_code=404, detail="Resource not found")
+
+            allowed = await check_resource_permission(
+                current_user,
+                self._db_manager,
+                resource["resource_type_name"],
+                resource["resource_type_version"],
+                "READ",
+            )
+            if not allowed:
+                raise HTTPException(status_code=403, detail="Insufficient permissions")
 
             def filter_fn(event: ResourceEvent) -> bool:
                 return event.resource_id == resource_id

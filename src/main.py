@@ -9,10 +9,12 @@ import logging
 import signal
 from typing import Any, Dict, List, Optional
 
+from auth import AuthManager, set_auth_manager
 from config import get_config
 from controller import Controller, ControllerConfig
 from db import DatabaseManager
 from events import EventBus
+from ldap_sync import LDAPSyncManager
 from plugins.registry import get_registry, register_builtin_plugins
 from plugins.inputs.base import InputPlugin
 
@@ -32,6 +34,8 @@ class Application:
         self.controller: Optional[Controller] = None
         self.event_bus: Optional[EventBus] = None
         self.input_plugins: List[InputPlugin] = []
+        self.auth_manager: Optional[AuthManager] = None
+        self.ldap_manager: Optional[LDAPSyncManager] = None
         self.running = False
 
     async def initialize(self):
@@ -56,6 +60,51 @@ class Application:
         await self.db.connect()
         await self.db.initialize_schema()
         logger.info("Database initialized")
+
+        # Initialize auth
+        auth_cfg = self.config.auth
+        self.auth_manager = AuthManager(
+            jwt_secret_key=auth_cfg.jwt_secret_key,
+            jwt_expiry_hours=auth_cfg.jwt_expiry_hours,
+        )
+        set_auth_manager(self.auth_manager)
+
+        # Bootstrap initial admin user if DB is empty
+        if (
+            auth_cfg.initial_admin_username
+            and auth_cfg.initial_admin_password
+            and await self.db.count_users() == 0
+        ):
+            pw_hash = self.auth_manager.hash_password(auth_cfg.initial_admin_password)
+            await self.db.create_user(
+                username=auth_cfg.initial_admin_username,
+                is_admin=True,
+                password_hash=pw_hash,
+                source="manual",
+            )
+            logger.info(
+                "Bootstrapped initial admin user: %s",
+                auth_cfg.initial_admin_username,
+            )
+
+        # Initialize LDAP manager (optional)
+        from ldap_sync import LDAPConfig as LDAPSyncConfig
+
+        ldap_cfg = self.config.ldap
+        ldap_sync_cfg = LDAPSyncConfig(
+            url=ldap_cfg.url,
+            bind_dn=ldap_cfg.bind_dn,
+            bind_password=ldap_cfg.bind_password,
+            base_dn=ldap_cfg.base_dn,
+            user_filter=ldap_cfg.user_filter,
+            attr_username=ldap_cfg.attr_username,
+            attr_email=ldap_cfg.attr_email,
+            attr_display_name=ldap_cfg.attr_display_name,
+            sync_interval=ldap_cfg.sync_interval,
+        )
+        self.ldap_manager = LDAPSyncManager(ldap_sync_cfg)
+        if self.ldap_manager.is_configured():
+            logger.info("LDAP configured: %s", ldap_cfg.url)
 
         # Initialize event bus
         self.event_bus = EventBus()
@@ -108,6 +157,10 @@ class Application:
             plugin = await registry.get_input_plugin(plugin_name, plugin_config)
             plugin.set_db_manager(self.db)
             plugin.set_event_bus(self.event_bus)
+            if hasattr(plugin, "set_auth_manager") and self.auth_manager:
+                plugin.set_auth_manager(self.auth_manager)
+            if hasattr(plugin, "set_ldap_manager") and self.ldap_manager:
+                plugin.set_ldap_manager(self.ldap_manager)
             self.input_plugins.append(plugin)
             logger.info(f"Initialized input plugin: {plugin_name}")
 
@@ -132,10 +185,30 @@ class Application:
         for plugin in self.input_plugins:
             tasks.append(asyncio.create_task(plugin.start(on_resource_event)))
 
+        # Optional periodic LDAP sync
+        if (
+            self.ldap_manager
+            and self.ldap_manager.is_configured()
+            and self.config.ldap.sync_interval > 0
+        ):
+            tasks.append(asyncio.create_task(self._ldap_sync_loop()))
+
         try:
             await asyncio.gather(*tasks)
         except asyncio.CancelledError:
             logger.info("Application tasks cancelled")
+
+    async def _ldap_sync_loop(self) -> None:
+        """Periodically synchronise LDAP users into the DB."""
+        interval = self.config.ldap.sync_interval
+        logger.info("Starting LDAP sync loop (interval=%ds)", interval)
+        while self.running:
+            try:
+                stats = await self.ldap_manager.sync_to_db(self.db)
+                logger.info("LDAP sync: %s", stats)
+            except Exception as exc:
+                logger.error("LDAP sync error: %s", exc)
+            await asyncio.sleep(interval)
 
     async def stop(self):
         """Stop the application gracefully."""
