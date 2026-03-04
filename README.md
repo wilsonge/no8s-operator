@@ -45,6 +45,8 @@ See [docs/installation.md](docs/installation.md) for manual installation, enviro
 - [ ] Slack/email notifications
 - [ ] Stable plugin API with backwards-compatibility guarantees
 - [ ] Runtime reconciler hot-reload
+- [ ] Add ability to require metadata keys on resource types (similar to SCP's)
+- [ ] Add roles that can only see resources with certain metadata (similar to ABAC)
 
 ## License
 
