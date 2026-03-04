@@ -23,7 +23,7 @@ dependencies = [
     "jsonschema==4.23.0",
     # Auth
     "PyJWT>=2.8",
-    "passlib[bcrypt]>=1.7.4",
+    "bcrypt>=5.0",
 ]
 
 [project.optional-dependencies]

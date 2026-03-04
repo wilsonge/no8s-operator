@@ -10,13 +10,11 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+import bcrypt
 import jwt
 from fastapi import Depends, HTTPException, Request
-from passlib.context import CryptContext
 
 logger = logging.getLogger(__name__)
-
-_pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
 class AuthManager:
@@ -34,11 +32,11 @@ class AuthManager:
 
     def hash_password(self, plain: str) -> str:
         """Return a bcrypt hash of *plain*."""
-        return _pwd_context.hash(plain)
+        return bcrypt.hashpw(plain.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
     def verify_password(self, plain: str, hashed: str) -> bool:
         """Return True if *plain* matches *hashed*."""
-        return _pwd_context.verify(plain, hashed)
+        return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
 
     # ------------------------------------------------------------------
     # JWT helpers
