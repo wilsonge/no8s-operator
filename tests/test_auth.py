@@ -11,13 +11,13 @@ from auth import AuthManager, check_system_permission
 
 class TestAuthManagerPasswords:
     def test_hash_and_verify(self):
-        mgr = AuthManager(jwt_secret_key="test-secret")
+        mgr = AuthManager(jwt_secret_key="test-secret-key-for-unit-tests-only-32b")
         hashed = mgr.hash_password("hunter2")
         assert hashed != "hunter2"
         assert mgr.verify_password("hunter2", hashed)
 
     def test_wrong_password_fails(self):
-        mgr = AuthManager(jwt_secret_key="test-secret")
+        mgr = AuthManager(jwt_secret_key="test-secret-key-for-unit-tests-only-32b")
         hashed = mgr.hash_password("correct")
         assert not mgr.verify_password("wrong", hashed)
 
@@ -28,7 +28,9 @@ class TestAuthManagerPasswords:
 
 class TestAuthManagerTokens:
     def setup_method(self):
-        self.mgr = AuthManager(jwt_secret_key="unit-test-secret", jwt_expiry_hours=1)
+        self.mgr = AuthManager(
+            jwt_secret_key="unit-test-secret-key-for-tests-only-32b", jwt_expiry_hours=1
+        )
         self.user = {
             "id": 42,
             "username": "alice",
@@ -52,7 +54,7 @@ class TestAuthManagerTokens:
 
     def test_wrong_secret_raises_401(self):
         token = self.mgr.create_token(self.user)
-        other = AuthManager(jwt_secret_key="other-secret")
+        other = AuthManager(jwt_secret_key="other-secret-key-for-unit-tests-only-32b")
         with pytest.raises(HTTPException) as exc_info:
             other.decode_token(token)
         assert exc_info.value.status_code == 401
@@ -68,7 +70,9 @@ class TestAuthManagerTokens:
             "source": "manual",
             "exp": datetime(2000, 1, 1, tzinfo=timezone.utc),
         }
-        token = jwt.encode(payload, "unit-test-secret", algorithm="HS256")
+        token = jwt.encode(
+            payload, "unit-test-secret-key-for-tests-only-32b", algorithm="HS256"
+        )
         with pytest.raises(HTTPException) as exc_info:
             self.mgr.decode_token(token)
         assert exc_info.value.status_code == 401
@@ -78,7 +82,7 @@ class TestDependencies:
     """Tests for get_current_user / require_* dependency functions."""
 
     def setup_method(self):
-        self.mgr = AuthManager(jwt_secret_key="dep-secret")
+        self.mgr = AuthManager(jwt_secret_key="dep-secret-key-for-unit-tests-only-32b")
         auth_module.set_auth_manager(self.mgr)
         self.user = {
             "id": 1,

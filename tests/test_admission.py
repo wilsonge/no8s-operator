@@ -100,7 +100,6 @@ class TestApplyPatches:
 # ==================== AdmissionChain tests ====================
 
 
-@pytest.mark.asyncio
 class TestAdmissionChain:
     """Tests for the admission webhook chain."""
 
@@ -530,7 +529,6 @@ class TestAdmissionChain:
 # ==================== Admission Webhook DB tests ====================
 
 
-@pytest.mark.asyncio
 class TestAdmissionWebhookDB:
     """Tests for admission webhook database operations."""
 

@@ -398,7 +398,7 @@ class TestCheckResourcePermission:
 
 class TestCreateTokenCustomRoleId:
     def test_custom_role_id_in_payload(self):
-        mgr = AuthManager(jwt_secret_key="test-secret")
+        mgr = AuthManager(jwt_secret_key="test-secret-key-for-unit-tests-only-32b")
         user = {
             "id": 1,
             "username": "alice",
@@ -412,7 +412,7 @@ class TestCreateTokenCustomRoleId:
         assert payload["is_admin"] is False
 
     def test_custom_role_id_none_when_absent(self):
-        mgr = AuthManager(jwt_secret_key="test-secret")
+        mgr = AuthManager(jwt_secret_key="test-secret-key-for-unit-tests-only-32b")
         user = {
             "id": 1,
             "username": "alice",
@@ -439,7 +439,7 @@ class TestCustomRoleEndpoints:
     """API tests for /api/v1/custom-roles endpoints."""
 
     def setup_method(self):
-        self.mgr = AuthManager(jwt_secret_key="test-secret")
+        self.mgr = AuthManager(jwt_secret_key="test-secret-key-for-unit-tests-only-32b")
         auth_module.set_auth_manager(self.mgr)
         self.admin = {
             "id": 1,
@@ -544,7 +544,7 @@ class TestResourceEndpointPermissions:
     """Tests that resource endpoints enforce check_resource_permission."""
 
     def setup_method(self):
-        self.mgr = AuthManager(jwt_secret_key="test-secret")
+        self.mgr = AuthManager(jwt_secret_key="test-secret-key-for-unit-tests-only-32b")
         auth_module.set_auth_manager(self.mgr)
         self.admin = {
             "id": 1,

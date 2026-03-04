@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Literal, Optional
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from auth import (
     check_resource_permission,
@@ -73,13 +73,23 @@ def validate_json_size(
 class ResourceTypeCreate(BaseModel):
     """Request model for creating a resource type."""
 
-    name: str = Field(..., description="Resource type name", example="PostgresCluster")
-    version: str = Field(..., description="Version string", example="v1")
-    schema: Dict[str, Any] = Field(..., description="OpenAPI v3 JSON Schema")
+    name: str = Field(
+        ...,
+        description="Resource type name",
+        json_schema_extra={"example": "PostgresCluster"},
+    )
+    version: str = Field(
+        ..., description="Version string", json_schema_extra={"example": "v1"}
+    )
+    resource_schema: Dict[str, Any] = Field(
+        ..., alias="schema", description="OpenAPI v3 JSON Schema"
+    )
     description: Optional[str] = Field(None, description="Description of resource type")
     metadata: Optional[Dict[str, Any]] = Field(None, description="Additional metadata")
 
-    @field_validator("schema")
+    model_config = ConfigDict(populate_by_name=True)
+
+    @field_validator("resource_schema")
     @classmethod
     def validate_schema(cls, v: Dict[str, Any]) -> Dict[str, Any]:
         is_valid, error = validate_openapi_schema(v)
@@ -91,12 +101,16 @@ class ResourceTypeCreate(BaseModel):
 class ResourceTypeUpdate(BaseModel):
     """Request model for updating a resource type."""
 
-    schema: Optional[Dict[str, Any]] = Field(None, description="Updated schema")
+    resource_schema: Optional[Dict[str, Any]] = Field(
+        None, alias="schema", description="Updated schema"
+    )
     description: Optional[str] = Field(None, description="Updated description")
     status: Optional[str] = Field(None, description="Status (active/deprecated)")
     metadata: Optional[Dict[str, Any]] = Field(None, description="Updated metadata")
 
-    @field_validator("schema")
+    model_config = ConfigDict(populate_by_name=True)
+
+    @field_validator("resource_schema")
     @classmethod
     def validate_schema(cls, v: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         if v is not None:
@@ -112,15 +126,14 @@ class ResourceTypeResponse(BaseModel):
     id: int
     name: str
     version: str
-    schema: Dict[str, Any]
+    resource_schema: Dict[str, Any] = Field(alias="schema")
     description: Optional[str] = None
     status: str = "active"
     metadata: Dict[str, Any] = {}
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
 
 # Resource models
@@ -129,12 +142,16 @@ class ResourceTypeResponse(BaseModel):
 class ResourceCreate(BaseModel):
     """Request model for creating a resource."""
 
-    name: str = Field(..., description="Resource name", example="my-vpc")
+    name: str = Field(
+        ..., description="Resource name", json_schema_extra={"example": "my-vpc"}
+    )
     resource_type_name: str = Field(
-        ..., description="Resource type name", example="PostgresCluster"
+        ...,
+        description="Resource type name",
+        json_schema_extra={"example": "PostgresCluster"},
     )
     resource_type_version: str = Field(
-        ..., description="Resource type version", example="v1"
+        ..., description="Resource type version", json_schema_extra={"example": "v1"}
     )
     action_plugin: Optional[str] = Field(
         default=None,
@@ -227,8 +244,7 @@ class ResourceResponse(BaseModel):
     updated_at: datetime
     last_reconcile_time: Optional[datetime] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class FinalizersUpdate(BaseModel):
@@ -361,8 +377,7 @@ class AdmissionWebhookResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class PluginInfo(BaseModel):
@@ -425,8 +440,7 @@ class UserResponse(BaseModel):
     last_login_at: Optional[datetime] = None
     last_synced_at: Optional[datetime] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class LDAPSyncResponse(BaseModel):
@@ -458,8 +472,7 @@ class RolePermissionResponse(BaseModel):
     operations: List[str]
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 _VALID_SYSTEM_PERMISSIONS = {"view_webhooks", "view_plugins"}
@@ -510,8 +523,7 @@ class CustomRoleResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class HTTPInputPlugin(InputPlugin):
@@ -966,7 +978,7 @@ class HTTPInputPlugin(InputPlugin):
                 rt_id = await self._db_manager.create_resource_type(
                     name=rt.name,
                     version=rt.version,
-                    schema=rt.schema,
+                    schema=rt.resource_schema,
                     description=rt.description,
                     metadata=rt.metadata,
                 )
@@ -1069,7 +1081,7 @@ class HTTPInputPlugin(InputPlugin):
             try:
                 await self._db_manager.update_resource_type(
                     resource_type_id=resource_type_id,
-                    schema=update.schema,
+                    schema=update.resource_schema,
                     description=update.description,
                     status=update.status,
                     metadata=update.metadata,

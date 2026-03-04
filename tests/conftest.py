@@ -58,7 +58,9 @@ def sample_resource():
 @pytest.fixture
 def mock_auth_manager():
     """An AuthManager instance pre-configured for tests."""
-    return AuthManager(jwt_secret_key="test-jwt-secret", jwt_expiry_hours=1)
+    return AuthManager(
+        jwt_secret_key="test-jwt-secret-key-for-unit-tests-only", jwt_expiry_hours=1
+    )
 
 
 @pytest.fixture
