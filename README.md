@@ -9,7 +9,15 @@ this fully production ready! But be warned if you're looking at it during these 
 
 ## What it is
 
-In some environments, Kubernetes isn't an option — but you still want the operational benefits of declarative infrastructure management: drift detection, automatic reconciliation, structured status tracking, and audit history. no8s-operator provides that, using PostgreSQL as the backing store and a plugin architecture where 3rd party reconcilers handle domain-specific resource types.
+In some environments, Kubernetes isn't an option — but you still want the operational benefits of declarative infrastructure
+management: drift detection, automatic reconciliation, structured status tracking, and audit history. no8s-operator
+provides that, using PostgreSQL as the backing store and a plugin architecture where 3rd party reconcilers handle
+domain-specific resource types.
+
+The primary reason here that we use PostgreSQL and drop kubernetes is to allow this to be provisioned as an active/passive
+setup that can be failed over at any given time (alongside a DNS swap), allowing users to run across regions or clouds in
+DR scenarios. In current kubernetes scenarios that would mean restoring cluster backups across cloud which can be slower
+to promote (e.g. https://aws.amazon.com/blogs/opensource/disaster-recovery-when-using-crossplane-for-infrastructure-provisioning-on-aws/),
 
 ## Features
 
@@ -40,6 +48,7 @@ See [docs/installation.md](docs/installation.md) for manual installation, enviro
 - [ ] GitOps integration (watch Git repos for changes)
 - [ ] Backstage integration
 - [ ] Multi-controller support with leader election
+  - [ ] Active/Passive setup documented for multi-region DR scenarios
 - [ ] Prometheus metrics
 - [ ] Policy enforcement (OPA integration)
 - [ ] Slack/email notifications
