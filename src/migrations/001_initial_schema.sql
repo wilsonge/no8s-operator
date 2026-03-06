@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS resources (
     retry_count INTEGER DEFAULT 0,
     last_reconcile_time TIMESTAMP,
     next_reconcile_time TIMESTAMP,
-    conditions JSONB NOT NULL DEFAULT '[]'::jsonb;
+    conditions JSONB NOT NULL DEFAULT '[]'::jsonb,
 
     -- Finalizers (Kubernetes-style deletion protection)
     finalizers JSONB NOT NULL DEFAULT '[]'::jsonb,
@@ -91,6 +91,15 @@ CREATE TABLE IF NOT EXISTS admission_webhooks (
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
     );
 
+CREATE TABLE custom_roles (
+    id                 SERIAL PRIMARY KEY,
+    name               VARCHAR(255) UNIQUE NOT NULL,
+    description        TEXT,
+    system_permissions JSONB NOT NULL DEFAULT '[]',
+    created_at         TIMESTAMPTZ DEFAULT NOW(),
+    updated_at         TIMESTAMPTZ DEFAULT NOW()
+);
+
 CREATE TYPE user_source AS ENUM ('manual', 'ldap');
 CREATE TYPE user_status AS ENUM ('active', 'suspended');
 
@@ -111,15 +120,6 @@ CREATE TABLE IF NOT EXISTS users (
     last_login_at   TIMESTAMPTZ,
     last_synced_at  TIMESTAMPTZ    -- populated on LDAP sync
     );
-
-CREATE TABLE custom_roles (
-    id                 SERIAL PRIMARY KEY,
-    name               VARCHAR(255) UNIQUE NOT NULL,
-    description        TEXT,
-    system_permissions JSONB NOT NULL DEFAULT '[]',
-    created_at         TIMESTAMPTZ DEFAULT NOW(),
-    updated_at         TIMESTAMPTZ DEFAULT NOW()
-);
 
 CREATE TABLE custom_role_permissions (
     id                    SERIAL PRIMARY KEY,
