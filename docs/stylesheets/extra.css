@@ -9,15 +9,20 @@
    White on the slate header background (~#1e1e2e): ~16:1 — passes WCAG AA.
    Material applies opacity: 0.7 to inactive tab links by default, which
    drops contrast below AA — override to 1 and use explicit colours instead. */
+/* Inactive tab links: slightly muted white via color alpha (not opacity, so
+   only text is affected). rgba(255,255,255,0.75) on #1e1e2e ≈ #c8c8cc — ~9:1. */
 [data-md-color-scheme="slate"][data-md-color-primary="deep-orange"] .md-tabs__link {
-  color: rgba(255, 255, 255, 0.87);
+  color: rgba(255, 255, 255, 0.75);
   opacity: 1;
 }
 
+/* Active/hovered: full white + orange underline so the active item is
+   distinguishable by more than colour alone (WCAG 1.4.1). */
 [data-md-color-scheme="slate"][data-md-color-primary="deep-orange"] .md-tabs__link--active,
 [data-md-color-scheme="slate"][data-md-color-primary="deep-orange"] .md-tabs__link:hover {
   color: #ffffff;
   opacity: 1;
+  border-bottom: 2px solid #ff6e40;
 }
 
 [data-md-color-scheme="slate"][data-md-color-primary="deep-orange"] .md-header__title,
