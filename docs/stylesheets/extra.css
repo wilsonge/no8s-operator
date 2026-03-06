@@ -1,15 +1,15 @@
 /* Light mode: darken header/tabs to deep orange 900 (#bf360c).
    Contrast with white: ~5.5:1 — passes WCAG AA. */
-[data-md-color-scheme="default"][data-md-color-primary="deep orange"] .md-header,
-[data-md-color-scheme="default"][data-md-color-primary="deep orange"] .md-tabs {
+[data-md-color-scheme="default"][data-md-color-primary="deep-orange"] .md-header,
+[data-md-color-scheme="default"][data-md-color-primary="deep-orange"] .md-tabs {
   background-color: #bf360c;
 }
 
 /* Dark mode: the header background is near-black; use a bright orange
    (#ff6e40, deep orange A200) for all primary foreground elements.
    Contrast on the slate header (~#1e1e2e): ~6.1:1 — passes WCAG AA. */
-[data-md-color-scheme="slate"][data-md-color-primary="deep orange"] .md-header,
-[data-md-color-scheme="slate"][data-md-color-primary="deep orange"] .md-tabs {
+[data-md-color-scheme="slate"][data-md-color-primary="deep-orange"] .md-header,
+[data-md-color-scheme="slate"][data-md-color-primary="deep-orange"] .md-tabs {
   --md-primary-fg-color: #ff6e40;
   --md-primary-fg-color--light: #ff6e40;
   --md-primary-fg-color--dark: #ff6e40;
