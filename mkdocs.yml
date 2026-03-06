@@ -1,0 +1,59 @@
+site_name: no8s-operator
+site_description: A Kubernetes-style controller for managing infrastructure without Kubernetes
+site_url: https://george-ohara.github.io/no8s-operator/
+repo_url: https://github.com/george-ohara/no8s-operator
+repo_name: george-ohara/no8s-operator
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+  - tables
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Getting Started:
+    - Installation: installation.md
+  - Concepts:
+    - Resource Types: resource-types.md
+    - Resources: resources.md
+    - Admission Controllers: admission-controllers.md
+    - Users & RBAC: users.md
+    - Leader Election: leader-election.md
+  - Extending:
+    - Writing a Reconciler: writing-a-reconciler.md
