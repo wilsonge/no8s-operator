@@ -47,8 +47,7 @@ See [docs/installation.md](docs/installation.md) for manual installation, enviro
 - [ ] OIDC authentication for users and services (e.g. GitLab)
 - [ ] GitOps integration (watch Git repos for changes)
 - [ ] Backstage integration
-- [ ] Multi-controller support with leader election
-  - [ ] Active/Passive setup documented for multi-region DR scenarios
+- [ ] Active/Passive clusters documented for multi-region DR scenarios
 - [ ] Prometheus metrics
 - [ ] Policy enforcement (OPA integration)
 - [ ] Slack/email notifications

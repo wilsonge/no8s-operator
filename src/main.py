@@ -15,6 +15,7 @@ from controller import Controller, ControllerConfig
 from db import DatabaseManager
 from events import EventBus
 from ldap_sync import LDAPSyncManager
+from leader_election import LeaderElection
 from plugins.registry import get_registry, register_builtin_plugins
 from plugins.inputs.base import InputPlugin
 
@@ -36,6 +37,7 @@ class Application:
         self.input_plugins: List[InputPlugin] = []
         self.auth_manager: Optional[AuthManager] = None
         self.ldap_manager: Optional[LDAPSyncManager] = None
+        self.leader_election: Optional[LeaderElection] = None
         self.running = False
 
     async def initialize(self):
@@ -164,6 +166,10 @@ class Application:
             self.input_plugins.append(plugin)
             logger.info(f"Initialized input plugin: {plugin_name}")
 
+        # Initialize leader election
+        le_cfg = self.config.leader_election
+        self.leader_election = LeaderElection(db=self.db, config=le_cfg)
+
         logger.info("All components initialized")
 
     async def start(self):
@@ -180,8 +186,15 @@ class Application:
             # Controller already polls database, so no immediate action needed
             # This callback can be used for more immediate reconciliation in the future
 
-        # Start controller and all input plugins concurrently
-        tasks = [asyncio.create_task(self.controller.start())]
+        # Start leader election wrapping the controller (only leader reconciles)
+        async def run_with_election():
+            await self.leader_election.run(
+                on_started_leading=self.controller.start,
+                on_stopped_leading=self.controller.stop,
+            )
+
+        tasks = [asyncio.create_task(run_with_election())]
+        # Input plugins (HTTP API) run on all instances regardless of leadership
         for plugin in self.input_plugins:
             tasks.append(asyncio.create_task(plugin.start(on_resource_event)))
 
@@ -214,6 +227,9 @@ class Application:
         """Stop the application gracefully."""
         logger.info("Stopping Operator Controller")
         self.running = False
+
+        if self.leader_election:
+            await self.leader_election.stop()
 
         if self.controller:
             await self.controller.stop()

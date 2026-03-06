@@ -199,6 +199,34 @@ class LDAPConfig:
 
 
 @dataclass
+class LeaderElectionConfig:
+    """Distributed leader election configuration."""
+
+    lock_name: str = "no8s-operator-leader"
+    holder_id: str = ""  # auto-generated at startup if empty
+    lease_duration_seconds: int = 30
+    renew_interval_seconds: int = 10
+    retry_interval_seconds: int = 5
+
+    @classmethod
+    def from_env(cls) -> "LeaderElectionConfig":
+        """Load from environment variables."""
+        return cls(
+            lock_name=os.getenv("LEADER_ELECTION_LOCK_NAME", "no8s-operator-leader"),
+            holder_id=os.getenv("LEADER_ELECTION_HOLDER_ID", ""),
+            lease_duration_seconds=int(
+                os.getenv("LEADER_ELECTION_LEASE_DURATION", "30")
+            ),
+            renew_interval_seconds=int(
+                os.getenv("LEADER_ELECTION_RENEW_INTERVAL", "10")
+            ),
+            retry_interval_seconds=int(
+                os.getenv("LEADER_ELECTION_RETRY_INTERVAL", "5")
+            ),
+        )
+
+
+@dataclass
 class Config:
     """Main configuration object."""
 
@@ -208,6 +236,7 @@ class Config:
     plugins: PluginConfig
     auth: AuthConfig = field(default_factory=AuthConfig)
     ldap: LDAPConfig = field(default_factory=LDAPConfig)
+    leader_election: LeaderElectionConfig = field(default_factory=LeaderElectionConfig)
 
     @classmethod
     def from_env(cls):
@@ -219,6 +248,7 @@ class Config:
             plugins=PluginConfig.from_env(),
             auth=AuthConfig.from_env(),
             ldap=LDAPConfig.from_env(),
+            leader_election=LeaderElectionConfig.from_env(),
         )
 
     @classmethod
@@ -231,6 +261,7 @@ class Config:
             plugins=PluginConfig(),
             auth=AuthConfig(),
             ldap=LDAPConfig(),
+            leader_election=LeaderElectionConfig(),
         )
 
 

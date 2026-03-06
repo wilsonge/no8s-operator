@@ -1650,3 +1650,49 @@ class DatabaseManager:
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow("SELECT COUNT(*) AS n FROM users")
             return int(row["n"])
+
+    async def acquire_or_renew_lock(
+        self,
+        resource_key: str,
+        holder_id: str,
+        lease_duration_seconds: int,
+    ) -> bool:
+        """Atomically acquire or renew a distributed lock.
+
+        Returns True if holder_id now holds the lock (acquired or renewed).
+        Returns False if another holder owns an unexpired lock.
+        """
+        self._ensure_connected()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO locks (resource_key, holder_id, acquired_at, lease_duration_seconds)
+                VALUES ($1, $2, NOW(), $3)
+                ON CONFLICT (resource_key) DO UPDATE
+                  SET holder_id = $2,
+                      acquired_at = NOW(),
+                      lease_duration_seconds = $3
+                  WHERE locks.acquired_at
+                            + (locks.lease_duration_seconds * interval '1 second') < NOW()
+                     OR locks.holder_id = $2
+                RETURNING resource_key
+                """,
+                resource_key,
+                holder_id,
+                lease_duration_seconds,
+            )
+            return row is not None
+
+    async def release_lock(self, resource_key: str, holder_id: str) -> bool:
+        """Release a lock held by holder_id.
+
+        Returns True if the lock was released, False if it was not held.
+        """
+        self._ensure_connected()
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM locks WHERE resource_key = $1 AND holder_id = $2",
+                resource_key,
+                holder_id,
+            )
+            return result.split()[-1] != "0"
