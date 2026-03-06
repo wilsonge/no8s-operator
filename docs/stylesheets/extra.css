@@ -1,0 +1,6 @@
+/* Override header/nav background with deep orange 900 (#bf360c).
+   Contrast ratio against white: ~5.5:1 — passes WCAG AA. */
+[data-md-color-primary="deep orange"] .md-header,
+[data-md-color-primary="deep orange"] .md-tabs {
+  background-color: #bf360c;
+}
