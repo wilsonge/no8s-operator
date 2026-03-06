@@ -5,12 +5,23 @@
   background-color: #bf360c;
 }
 
-/* Dark mode: the header background is near-black; use a bright orange
-   (#ff6e40, deep orange A200) for all primary foreground elements.
-   Contrast on the slate header (~#1e1e2e): ~6.1:1 — passes WCAG AA. */
-[data-md-color-scheme="slate"][data-md-color-primary="deep-orange"] .md-header,
-[data-md-color-scheme="slate"][data-md-color-primary="deep-orange"] .md-tabs {
-  --md-primary-fg-color: #ff6e40;
-  --md-primary-fg-color--light: #ff6e40;
-  --md-primary-fg-color--dark: #ff6e40;
+/* Dark mode: force tab and header text to white at full opacity.
+   White on the slate header background (~#1e1e2e): ~16:1 — passes WCAG AA.
+   Material applies opacity: 0.7 to inactive tab links by default, which
+   drops contrast below AA — override to 1 and use explicit colours instead. */
+[data-md-color-scheme="slate"][data-md-color-primary="deep-orange"] .md-tabs__link {
+  color: rgba(255, 255, 255, 0.87);
+  opacity: 1;
+}
+
+[data-md-color-scheme="slate"][data-md-color-primary="deep-orange"] .md-tabs__link--active,
+[data-md-color-scheme="slate"][data-md-color-primary="deep-orange"] .md-tabs__link:hover {
+  color: #ffffff;
+  opacity: 1;
+}
+
+[data-md-color-scheme="slate"][data-md-color-primary="deep-orange"] .md-header__title,
+[data-md-color-scheme="slate"][data-md-color-primary="deep-orange"] .md-header__button {
+  color: #ffffff;
+  opacity: 1;
 }
