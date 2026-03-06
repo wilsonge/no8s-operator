@@ -1,8 +1,8 @@
 site_name: no8s-operator
 site_description: A Kubernetes-style controller for managing infrastructure without Kubernetes
-site_url: https://george-ohara.github.io/no8s-operator/
-repo_url: https://github.com/george-ohara/no8s-operator
-repo_name: george-ohara/no8s-operator
+site_url: https://wilsonge.github.io/no8s-operator/
+repo_url: https://github.com/wilsonge/no8s-operator
+repo_name: wilsonge/no8s-operator
 
 theme:
   name: material
