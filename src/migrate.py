@@ -86,9 +86,15 @@ async def apply_migration(
     logger.info(f"Applied migration {filename}")
 
 
+MIGRATION_LOCK_KEY = 8472910346  # Arbitrary stable key for pg_advisory_lock
+
+
 async def run_migrations(pool: asyncpg.Pool) -> int:
     """
     Discover and apply all pending migrations in order.
+
+    Uses a PostgreSQL advisory lock so that concurrent instances do not race
+    to apply the same migrations when starting simultaneously.
 
     Args:
         pool: An asyncpg connection pool (must already be connected).
@@ -101,27 +107,33 @@ async def run_migrations(pool: asyncpg.Pool) -> int:
         asyncpg.PostgresError: If a migration fails (it is rolled back;
             previously applied migrations remain).
     """
-    async with pool.acquire() as conn:
-        await ensure_migration_table(conn)
-
     all_migrations = discover_migrations()
     if not all_migrations:
         logger.info("No migration files found")
         return 0
 
     async with pool.acquire() as conn:
-        applied = await get_applied_versions(conn)
+        # Acquire a session-level advisory lock — blocks until the lock is free.
+        # This ensures only one instance runs migrations at a time.
+        await conn.execute("SELECT pg_advisory_lock($1)", MIGRATION_LOCK_KEY)
+        try:
+            await ensure_migration_table(conn)
+            # Re-read applied versions *inside* the lock so we see any
+            # migrations already applied by another instance that held the
+            # lock before us.
+            applied = await get_applied_versions(conn)
+            pending = [(v, name, path) for v, name, path in all_migrations if v not in applied]
 
-    pending = [(v, name, path) for v, name, path in all_migrations if v not in applied]
+            if not pending:
+                logger.info("Database schema is up to date")
+                return 0
 
-    if not pending:
-        logger.info("Database schema is up to date")
-        return 0
+            logger.info(f"Applying {len(pending)} pending migration(s)")
 
-    logger.info(f"Applying {len(pending)} pending migration(s)")
+            for version, filename, path in pending:
+                await apply_migration(pool, version, filename, path)
 
-    for version, filename, path in pending:
-        await apply_migration(pool, version, filename, path)
-
-    logger.info(f"Successfully applied {len(pending)} migration(s)")
-    return len(pending)
+            logger.info(f"Successfully applied {len(pending)} migration(s)")
+            return len(pending)
+        finally:
+            await conn.execute("SELECT pg_advisory_unlock($1)", MIGRATION_LOCK_KEY)

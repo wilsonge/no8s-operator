@@ -4,8 +4,11 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock
 from contextlib import asynccontextmanager
 
+import pglast
 import migrate
 from migrate import (
+    MIGRATIONS_DIR,
+    MIGRATION_LOCK_KEY,
     discover_migrations,
     ensure_migration_table,
     get_applied_versions,
@@ -288,10 +291,13 @@ class TestRunMigrations:
         assert result == 0
 
     async def test_ensures_migration_table_first(self, tmp_path, monkeypatch):
-        """Test that schema_migrations table is created before anything else."""
+        """Test that schema_migrations table is created inside the advisory lock."""
+        (tmp_path / "001_initial.sql").write_text("SELECT 1;")
         monkeypatch.setattr(migrate, "MIGRATIONS_DIR", tmp_path)
 
         conn = AsyncMock()
+        conn.fetch = AsyncMock(return_value=[{"version": "001"}])
+
         pool = AsyncMock()
 
         @asynccontextmanager
@@ -302,6 +308,32 @@ class TestRunMigrations:
 
         await run_migrations(pool)
 
-        conn.execute.assert_called_once()
-        sql = conn.execute.call_args[0][0]
-        assert "CREATE TABLE IF NOT EXISTS schema_migrations" in sql
+        call_args_list = [call[0][0] for call in conn.execute.call_args_list]
+        assert any("pg_advisory_lock" in c for c in call_args_list)
+        assert any("CREATE TABLE IF NOT EXISTS schema_migrations" in c for c in call_args_list)
+        # Advisory lock must be acquired before the CREATE TABLE
+        lock_idx = next(i for i, c in enumerate(call_args_list) if "pg_advisory_lock" in c)
+        table_idx = next(i for i, c in enumerate(call_args_list) if "CREATE TABLE" in c)
+        assert lock_idx < table_idx
+
+
+class TestMigrationSqlSyntax:
+    """Parse every migration file with the real PostgreSQL parser (no DB required)."""
+
+    def _migration_files(self):
+        return list(MIGRATIONS_DIR.glob("*.sql"))
+
+    def test_migration_files_exist(self):
+        """Sanity check: the migrations directory contains at least one file."""
+        assert self._migration_files(), f"No migration files found in {MIGRATIONS_DIR}"
+
+    @pytest.mark.parametrize(
+        "path",
+        list(MIGRATIONS_DIR.glob("*.sql")),
+        ids=lambda p: p.name,
+    )
+    def test_sql_parses_without_errors(self, path):
+        """Each migration file must parse cleanly under the PostgreSQL grammar."""
+        sql = path.read_text(encoding="utf-8")
+        # pglast.parse_sql raises pglast.Error on any syntax problem
+        pglast.parse_sql(sql)
