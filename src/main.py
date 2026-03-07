@@ -10,6 +10,7 @@ import signal
 from typing import Any, Dict, List, Optional
 
 from auth import AuthManager, set_auth_manager
+from cluster_status import create_cluster_status_router
 from config import get_config
 from controller import Controller, ControllerConfig
 from db import DatabaseManager
@@ -140,6 +141,16 @@ class Application:
             event_bus=self.event_bus,
         )
 
+        # Initialize leader election
+        le_cfg = self.config.leader_election
+        self.leader_election = LeaderElection(db=self.db, config=le_cfg)
+
+        # Build core routers to be mounted before plugins are initialized
+        cluster_status_router = create_cluster_status_router(
+            leader_election=self.leader_election,
+            db_manager=self.db,
+        )
+
         # Determine which input plugins to load
         enabled_inputs = self.config.plugins.enabled_input_plugins
         if not enabled_inputs:
@@ -163,12 +174,9 @@ class Application:
                 plugin.set_auth_manager(self.auth_manager)
             if hasattr(plugin, "set_ldap_manager") and self.ldap_manager:
                 plugin.set_ldap_manager(self.ldap_manager)
+            plugin.mount_router(cluster_status_router)
             self.input_plugins.append(plugin)
             logger.info(f"Initialized input plugin: {plugin_name}")
-
-        # Initialize leader election
-        le_cfg = self.config.leader_election
-        self.leader_election = LeaderElection(db=self.db, config=le_cfg)
 
         logger.info("All components initialized")
 

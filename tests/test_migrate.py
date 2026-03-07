@@ -8,7 +8,6 @@ import pglast
 import migrate
 from migrate import (
     MIGRATIONS_DIR,
-    MIGRATION_LOCK_KEY,
     discover_migrations,
     ensure_migration_table,
     get_applied_versions,
@@ -310,9 +309,13 @@ class TestRunMigrations:
 
         call_args_list = [call[0][0] for call in conn.execute.call_args_list]
         assert any("pg_advisory_lock" in c for c in call_args_list)
-        assert any("CREATE TABLE IF NOT EXISTS schema_migrations" in c for c in call_args_list)
+        assert any(
+            "CREATE TABLE IF NOT EXISTS schema_migrations" in c for c in call_args_list
+        )
         # Advisory lock must be acquired before the CREATE TABLE
-        lock_idx = next(i for i, c in enumerate(call_args_list) if "pg_advisory_lock" in c)
+        lock_idx = next(
+            i for i, c in enumerate(call_args_list) if "pg_advisory_lock" in c
+        )
         table_idx = next(i for i, c in enumerate(call_args_list) if "CREATE TABLE" in c)
         assert lock_idx < table_idx
 

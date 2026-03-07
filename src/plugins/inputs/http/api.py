@@ -545,6 +545,7 @@ class HTTPInputPlugin(InputPlugin):
         self._auth_manager = None
         self._ldap_manager = None
         self._config: Dict[str, Any] = {}
+        self._extra_routers: List = []
 
     @property
     def name(self) -> str:
@@ -593,6 +594,10 @@ class HTTPInputPlugin(InputPlugin):
     def set_ldap_manager(self, ldap_manager) -> None:
         """Set the LDAP sync manager."""
         self._ldap_manager = ldap_manager
+
+    def mount_router(self, router) -> None:
+        """Queue an additional APIRouter to be mounted when the server starts."""
+        self._extra_routers.append(router)
 
     def _setup_routes(self) -> None:
         """
@@ -2028,6 +2033,8 @@ class HTTPInputPlugin(InputPlugin):
         """Start the HTTP server."""
         self._on_resource_event = on_resource_event
         self._setup_routes()
+        for router in self._extra_routers:
+            self.app.include_router(router)
 
         config = uvicorn.Config(
             self.app,

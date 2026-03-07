@@ -1696,3 +1696,24 @@ class DatabaseManager:
                 holder_id,
             )
             return result.split()[-1] != "0"
+
+    async def ping(self) -> bool:
+        """Return True if the database connection is healthy, False otherwise."""
+        try:
+            self._ensure_connected()
+            async with self.pool.acquire() as conn:
+                await conn.fetchval("SELECT 1")
+            return True
+        except Exception:
+            return False
+
+    async def get_leader_lock_info(self, resource_key: str) -> Optional[Dict[str, Any]]:
+        """Return current lock row for resource_key, or None if no lock exists."""
+        self._ensure_connected()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT holder_id, acquired_at, lease_duration_seconds "
+                "FROM locks WHERE resource_key = $1",
+                resource_key,
+            )
+            return dict(row) if row else None

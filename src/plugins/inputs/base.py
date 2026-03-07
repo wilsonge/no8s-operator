@@ -159,3 +159,15 @@ class InputPlugin(ABC):
             event_bus: The EventBus instance
         """
         pass
+
+    def mount_router(self, router: Any) -> None:
+        """
+        Mount an additional router onto this plugin's HTTP server.
+
+        Override this method in subclasses that serve HTTP traffic to expose
+        core routes (e.g. cluster status) on the same port as the plugin.
+
+        Args:
+            router: A framework router (e.g. fastapi.APIRouter) to mount
+        """
+        pass

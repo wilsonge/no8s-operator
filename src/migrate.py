@@ -122,7 +122,9 @@ async def run_migrations(pool: asyncpg.Pool) -> int:
             # migrations already applied by another instance that held the
             # lock before us.
             applied = await get_applied_versions(conn)
-            pending = [(v, name, path) for v, name, path in all_migrations if v not in applied]
+            pending = [
+                (v, name, path) for v, name, path in all_migrations if v not in applied
+            ]
 
             if not pending:
                 logger.info("Database schema is up to date")
