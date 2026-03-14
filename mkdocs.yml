@@ -60,3 +60,4 @@ nav:
     - Leader Election: leader-election.md
   - Extending:
     - Writing a Reconciler: writing-a-reconciler.md
+    - Action Plugins: action-plugins.md

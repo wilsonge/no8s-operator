@@ -15,7 +15,7 @@ The primary reason here that we use PostgreSQL and drop Kubernetes is to allow t
 
 - **Declarative infrastructure** — define desired state; reconciler plugins drive resources to `ready`
 - **Resource types with schema validation** — OpenAPI v3 schemas, similar to Kubernetes CRDs
-- **3rd party reconciler plugins** — pip packages auto-discovered via Python entry points
+- **3rd party reconciler plugins** — pip packages auto-discovered via Python entry points (see [Reconciler Architecture](reconciler-architecture.md))
 - **Authentication and RBAC** — JWT bearer tokens, bcrypt passwords, LDAP integration, custom roles with per-resource-type CRUD permissions
 - **Finalizers** — Kubernetes-style deletion protection
 - **Status conditions** — named conditions (`Ready`, `Reconciling`, `Degraded`) plus domain-specific conditions from reconciler plugins

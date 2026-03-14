@@ -34,6 +34,50 @@ to promote (e.g. https://aws.amazon.com/blogs/opensource/disaster-recovery-when-
 - **Exponential Backoff**: Failed reconciliations retry with intelligent backoff
 - **Concurrent Reconciliation**: Multiple resources reconciled in parallel
 
+## Architecture
+
+The system follows a delegated controller pattern inspired by Kubernetes:
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                      Operator Controller                         │
+│                                                                  │
+│  ┌────────────────┐    ┌──────────────────────────────────────┐  │
+│  │  Input Plugins │───▶│      Main Loop (controller.py)       │  │
+│  │  (HTTP, SQS,   │    │                                      │  │
+│  │   Polling)     │    │  1. Receive resource events          │  │
+│  └────────────────┘    │  2. Cache resource state             │  │
+│                        │  3. Dispatch to reconciler plugin    │  │
+│                        │  4. Update status and metadata       │  │
+│                        └──────────┬───────────────────────────┘  │
+│                                   │                              │
+│              ┌────────────────────┼─────────────────────┐        │
+│              │                                          │        │
+│              ▼                                          ▼        │
+│  ┌───────────────────┐                       ┌─────────────────┐ │
+│  │ Reconciler Plugin │                       │Reconciler Plugin│ │
+│  │ (pip: no8s-db)    │                       │(pip: no8s-dns)  │ │
+│  │                   │                       │                 │ │
+│  │ ResourceType:     │                       │ ResourceType:   │ │
+│  │  DatabaseCluster  │                       │  DnsRecord      │ │
+│  └────────┬──────────┘                       └───────┬─────────┘ │
+│           │ (optional)                               │ (direct)  │
+└───────────┼──────────────────────────────────────────┼───────────┘
+            ▼                                          ▼
+    ┌──────────────┐                           ┌────────────┐
+    │ Action Plugin│                           │  External  │
+    │ (GitHub      │                           │  API       │
+    │  Actions)    │                           │            │
+    └──────────────┘                           └────────────┘
+            │
+            ▼
+    ┌──────────┐
+    │PostgreSQL│
+    │ Resource │
+    │  Store   │
+    └──────────┘
+```
+
 ## Quick start
 
 ```bash

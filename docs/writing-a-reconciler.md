@@ -2,6 +2,8 @@
 
 This guide walks through building a no8s reconciler plugin. If you've written a Kubernetes controller or operator, the concepts map directly — reconciler plugins are the equivalent of a controller's `Reconcile()` function, packaged as a standalone pip-installable module.
 
+For an overview of how reconcilers fit into the operator's two-tier architecture, see [Reconciler Architecture](reconciler-architecture.md).
+
 ## Concepts
 
 | Kubernetes                       | no8s                                                        |
