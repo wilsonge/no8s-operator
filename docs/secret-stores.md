@@ -60,7 +60,16 @@ AWS_REGION=eu-west-1
 
 ## Using the secret store in plugins
 
-Action plugins and reconciler plugins can retrieve secrets at runtime:
+Action plugins and reconciler plugins can retrieve secrets at runtime via
+`get_secret_store()`, which returns the already-initialised singleton — repeated
+calls are cheap.
+
+`get_secret` raises `KeyError` if the secret is not found, so callers should
+handle that case.
+
+### Action plugins
+
+Load secrets in `initialize()` and cache them on `self`:
 
 ```python
 from plugins.registry import get_secret_store
@@ -71,8 +80,41 @@ class MyActionPlugin(ActionPlugin):
         self._api_token = await store.get_secret("MY_API_TOKEN")
 ```
 
-`get_secret` raises `KeyError` if the secret is not found, so callers should
-handle that case.
+### Reconciler plugins
+
+For stable secrets (static API tokens, fixed passwords), load once in `start()`:
+
+```python
+from plugins.registry import get_secret_store
+
+class DatabaseClusterReconciler(ReconcilerPlugin):
+
+    async def start(self, ctx: ReconcilerContext) -> None:
+        store = await get_secret_store()
+        try:
+            self._root_password = await store.get_secret("POSTGRES_ROOT_PASSWORD")
+        except KeyError:
+            raise RuntimeError("Required secret 'POSTGRES_ROOT_PASSWORD' not found")
+
+        while not ctx.shutdown_event.is_set():
+            ...
+```
+
+For short-lived or rotated secrets (Vault dynamic credentials, STS tokens),
+fetch inside `reconcile()` on each call:
+
+```python
+    async def reconcile(self, resource, ctx):
+        store = await get_secret_store()
+        try:
+            password = await store.get_secret("POSTGRES_ROOT_PASSWORD")
+        except KeyError:
+            await ctx.update_status(resource["id"], "failed",
+                                    message="Secret POSTGRES_ROOT_PASSWORD not found")
+            return ReconcileResult(success=False,
+                                   message="Secret POSTGRES_ROOT_PASSWORD not found")
+        # use password ...
+```
 
 ---
 

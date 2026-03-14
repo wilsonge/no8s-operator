@@ -396,6 +396,67 @@ Conditions appear in every resource GET response:
 }
 ```
 
+## Using the Secret Store
+
+Reconciler plugins can retrieve secrets from the operator's active secret store — whichever backend is configured (`env`, `vault`, `aws_secrets_manager`, or a custom plugin).  This is the correct way to access sensitive values such as API tokens, database root passwords, or TLS private keys.  Never read `os.environ` directly; the active backend may not be environment variables.
+
+### Loading secrets once at startup
+
+If the secret value is stable for the lifetime of the reconciler (e.g. a static API token), load it in `start()` and cache it on `self`:
+
+```python
+from plugins.registry import get_secret_store
+
+class DatabaseClusterReconciler(ReconcilerPlugin):
+
+    def __init__(self):
+        self._root_password: str = ""
+
+    async def start(self, ctx: ReconcilerContext) -> None:
+        store = await get_secret_store()
+        try:
+            self._root_password = await store.get_secret("POSTGRES_ROOT_PASSWORD")
+        except KeyError:
+            raise RuntimeError(
+                "Required secret 'POSTGRES_ROOT_PASSWORD' not found in the active secret store"
+            )
+
+        while not ctx.shutdown_event.is_set():
+            ...
+```
+
+### Loading secrets per reconciliation
+
+If the secret may rotate (e.g. a short-lived Vault lease), fetch it inside `reconcile()` on each call:
+
+```python
+async def reconcile(self, resource: Dict[str, Any], ctx: ReconcilerContext) -> ReconcileResult:
+    store = await get_secret_store()
+    try:
+        password = await store.get_secret("POSTGRES_ROOT_PASSWORD")
+    except KeyError:
+        await ctx.update_status(resource["id"], "failed",
+                                message="Secret POSTGRES_ROOT_PASSWORD not found")
+        return ReconcileResult(success=False,
+                               message="Secret POSTGRES_ROOT_PASSWORD not found")
+
+    # use password ...
+```
+
+`get_secret_store()` returns the already-initialised singleton — repeated calls are cheap.
+
+### Choosing the right approach
+
+| Secret characteristic | Recommended pattern |
+|-|-|
+| Long-lived, static (API keys, fixed passwords) | Load once in `start()`, cache on `self` |
+| Short-lived or rotated (Vault dynamic secrets, STS tokens) | Fetch in `reconcile()` each time |
+| Needed only during deletion | Fetch in `_handle_delete()` |
+
+See [Secret Stores](secret-stores.md) for available backends and how to write a custom one.
+
+---
+
 ## Using Action Plugins
 
 Reconcilers can optionally delegate execution to action plugins. This is useful when reconciliation involves triggering an external CI/CD system rather than calling APIs directly.
