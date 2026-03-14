@@ -50,3 +50,7 @@ configuration is needed — leader election starts automatically on every instan
 - **All instances** serve the HTTP API and handle resource mutations.
 - On graceful shutdown the leader releases its lock so a standby can take over
   immediately without waiting for lease expiry.
+
+See [Cluster Nodes](cluster-nodes.md) for the API endpoint that exposes cluster membership,
+node health, and leader lock state — including how failovers and split-brain scenarios
+appear in the response.

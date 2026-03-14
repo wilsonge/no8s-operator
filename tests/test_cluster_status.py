@@ -1,7 +1,8 @@
-"""Tests for the cluster health/status endpoints and the get_leader_lock_info DB method."""
+"""Tests for the cluster health/nodes endpoints and related DB methods."""
 
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 from unittest.mock import AsyncMock, MagicMock
 
 from fastapi import FastAPI
@@ -9,7 +10,7 @@ from fastapi.testclient import TestClient
 
 import auth as auth_module
 from auth import AuthManager, get_current_user, require_admin
-from cluster_status import create_cluster_status_router
+from cluster_status import _format_age, create_cluster_status_router
 from config import LeaderElectionConfig
 from db import DatabaseManager
 from leader_election import LeaderElection
@@ -86,6 +87,26 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _node_row(
+    *,
+    node_id: str = "host-a:1:aaa",
+    hostname: str = "host-a",
+    pid: str = "1",
+    first_seen: Optional[datetime] = None,
+    last_heartbeat: Optional[datetime] = None,
+    lease_duration_seconds: int = 60,
+) -> dict:
+    now = _now()
+    return {
+        "node_id": node_id,
+        "hostname": hostname,
+        "pid": pid,
+        "first_seen": first_seen or now,
+        "last_heartbeat": last_heartbeat or now,
+        "lease_duration_seconds": lease_duration_seconds,
+    }
+
+
 # ---------------------------------------------------------------------------
 # DB: get_leader_lock_info
 # ---------------------------------------------------------------------------
@@ -158,11 +179,113 @@ class TestClusterHealth:
 
 
 # ---------------------------------------------------------------------------
-# HTTP: GET /api/v1/cluster/status — admin only
+# _format_age helper
 # ---------------------------------------------------------------------------
 
 
-class TestClusterStatusAuth:
+class TestFormatAge:
+    def test_seconds_only(self):
+        assert _format_age(timedelta(seconds=45)) == "45s"
+
+    def test_minutes_and_seconds(self):
+        assert _format_age(timedelta(minutes=3, seconds=20)) == "3m20s"
+
+    def test_minutes_no_seconds(self):
+        assert _format_age(timedelta(minutes=10)) == "10m"
+
+    def test_hours_and_minutes(self):
+        assert _format_age(timedelta(hours=2, minutes=30)) == "2h30m"
+
+    def test_hours_no_minutes(self):
+        assert _format_age(timedelta(hours=5)) == "5h"
+
+    def test_days_and_hours(self):
+        assert _format_age(timedelta(days=3, hours=4)) == "3d4h"
+
+    def test_days_no_hours(self):
+        assert _format_age(timedelta(days=7)) == "7d"
+
+    def test_negative_returns_zero(self):
+        assert _format_age(timedelta(seconds=-10)) == "0s"
+
+
+# ---------------------------------------------------------------------------
+# DB: register_node / get_cluster_nodes / deregister_node
+# ---------------------------------------------------------------------------
+
+
+class TestRegisterNode:
+    async def test_execute_called_with_correct_params(self):
+        db, conn = _make_db()
+        conn.execute = AsyncMock(return_value=None)
+
+        await db.register_node(
+            node_id="host:1234:uuid",
+            hostname="host",
+            pid="1234",
+            lease_duration_seconds=60,
+        )
+
+        conn.execute.assert_called_once()
+        call_args = conn.execute.call_args[0]
+        assert "INSERT INTO cluster_nodes" in call_args[0]
+        assert call_args[1] == "host:1234:uuid"
+        assert call_args[2] == "host"
+        assert call_args[3] == "1234"
+        assert call_args[4] == 60
+
+
+class TestGetClusterNodes:
+    async def test_returns_list_of_dicts(self):
+        db, conn = _make_db()
+        now = _now()
+        conn.fetch = AsyncMock(
+            return_value=[
+                {
+                    "node_id": "host-a:1:aaa",
+                    "hostname": "host-a",
+                    "pid": "1",
+                    "first_seen": now,
+                    "last_heartbeat": now,
+                    "lease_duration_seconds": 60,
+                }
+            ]
+        )
+
+        result = await db.get_cluster_nodes()
+
+        assert len(result) == 1
+        assert result[0]["node_id"] == "host-a:1:aaa"
+        assert result[0]["hostname"] == "host-a"
+
+    async def test_returns_empty_list_when_no_nodes(self):
+        db, conn = _make_db()
+        conn.fetch = AsyncMock(return_value=[])
+
+        result = await db.get_cluster_nodes()
+
+        assert result == []
+
+
+class TestDeregisterNode:
+    async def test_execute_called_with_node_id(self):
+        db, conn = _make_db()
+        conn.execute = AsyncMock(return_value=None)
+
+        await db.deregister_node("host:1234:uuid")
+
+        conn.execute.assert_called_once()
+        call_args = conn.execute.call_args[0]
+        assert "DELETE FROM cluster_nodes" in call_args[0]
+        assert call_args[1] == "host:1234:uuid"
+
+
+# ---------------------------------------------------------------------------
+# HTTP: GET /api/v1/cluster/nodes — auth
+# ---------------------------------------------------------------------------
+
+
+class TestClusterNodesAuth:
     def setup_method(self):
         self.mgr = AuthManager(jwt_secret_key="test-secret-key-for-unit-tests-only-32b")
         auth_module.set_auth_manager(self.mgr)
@@ -172,7 +295,7 @@ class TestClusterStatusAuth:
         le = _make_le()
         client = _make_client(le, db)
 
-        resp = client.get("/api/v1/cluster/status")
+        resp = client.get("/api/v1/cluster/nodes")
 
         assert resp.status_code == 401
 
@@ -181,69 +304,83 @@ class TestClusterStatusAuth:
         le = _make_le()
         app = FastAPI()
         app.include_router(create_cluster_status_router(le, db))
-        # Override only get_current_user so require_admin still runs its admin check
         app.dependency_overrides[get_current_user] = lambda: _viewer()
         client = TestClient(app, raise_server_exceptions=False)
 
-        resp = client.get("/api/v1/cluster/status")
+        resp = client.get("/api/v1/cluster/nodes")
 
         assert resp.status_code == 403
 
     async def test_admin_can_access(self):
         db = AsyncMock(spec=DatabaseManager)
         db.get_leader_lock_info = AsyncMock(return_value=None)
+        db.get_cluster_nodes = AsyncMock(return_value=[])
         le = _make_le()
         client = _make_client(le, db, user=_admin())
 
-        resp = client.get("/api/v1/cluster/status")
+        resp = client.get("/api/v1/cluster/nodes")
 
         assert resp.status_code == 200
 
 
 # ---------------------------------------------------------------------------
-# HTTP: GET /api/v1/cluster/status — response content
+# HTTP: GET /api/v1/cluster/nodes — this_instance fields
 # ---------------------------------------------------------------------------
 
 
-class TestClusterStatusResponse:
-    async def test_leader_instance_returns_is_leader_true(self):
+class TestClusterNodesThisInstance:
+    async def test_this_instance_id_reflects_leader_election_holder(self):
         db = AsyncMock(spec=DatabaseManager)
         db.get_leader_lock_info = AsyncMock(return_value=None)
-        le = _make_le(is_leader=True, holder_id="leader-host:1:abc")
+        db.get_cluster_nodes = AsyncMock(return_value=[])
+        le = _make_le(holder_id="myhost:99:zzz")
         client = _make_client(le, db, user=_admin())
 
-        resp = client.get("/api/v1/cluster/status")
+        resp = client.get("/api/v1/cluster/nodes")
 
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["is_leader"] is True
-        assert data["instance_id"] == "leader-host:1:abc"
+        assert resp.json()["this_instance_id"] == "myhost:99:zzz"
 
-    async def test_standby_instance_returns_is_leader_false(self):
+    async def test_this_instance_is_leader_true_when_leading(self):
         db = AsyncMock(spec=DatabaseManager)
         db.get_leader_lock_info = AsyncMock(return_value=None)
-        le = _make_le(is_leader=False, holder_id="standby-host:2:xyz")
+        db.get_cluster_nodes = AsyncMock(return_value=[])
+        le = _make_le(is_leader=True)
         client = _make_client(le, db, user=_admin())
 
-        resp = client.get("/api/v1/cluster/status")
+        resp = client.get("/api/v1/cluster/nodes")
 
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["is_leader"] is False
-        assert data["instance_id"] == "standby-host:2:xyz"
+        assert resp.json()["this_instance_is_leader"] is True
 
-    async def test_leader_is_null_when_no_lock_row(self):
+    async def test_this_instance_is_leader_false_when_follower(self):
         db = AsyncMock(spec=DatabaseManager)
         db.get_leader_lock_info = AsyncMock(return_value=None)
+        db.get_cluster_nodes = AsyncMock(return_value=[])
+        le = _make_le(is_leader=False)
+        client = _make_client(le, db, user=_admin())
+
+        resp = client.get("/api/v1/cluster/nodes")
+
+        assert resp.json()["this_instance_is_leader"] is False
+
+
+# ---------------------------------------------------------------------------
+# HTTP: GET /api/v1/cluster/nodes — leader_lock field
+# ---------------------------------------------------------------------------
+
+
+class TestClusterNodesLeaderLock:
+    async def test_leader_lock_null_when_no_lock_row(self):
+        db = AsyncMock(spec=DatabaseManager)
+        db.get_leader_lock_info = AsyncMock(return_value=None)
+        db.get_cluster_nodes = AsyncMock(return_value=[])
         le = _make_le()
         client = _make_client(le, db, user=_admin())
 
-        resp = client.get("/api/v1/cluster/status")
+        resp = client.get("/api/v1/cluster/nodes")
 
-        assert resp.status_code == 200
-        assert resp.json()["leader"] is None
+        assert resp.json()["leader_lock"] is None
 
-    async def test_leader_info_populated_from_db(self):
+    async def test_leader_lock_populated_from_db(self):
         acquired = datetime(2026, 3, 7, 10, 0, 0, tzinfo=timezone.utc)
         db = AsyncMock(spec=DatabaseManager)
         db.get_leader_lock_info = AsyncMock(
@@ -253,18 +390,18 @@ class TestClusterStatusResponse:
                 "lease_duration_seconds": 30,
             }
         )
-        le = _make_le(is_leader=False)
+        db.get_cluster_nodes = AsyncMock(return_value=[])
+        le = _make_le()
         client = _make_client(le, db, user=_admin())
 
-        resp = client.get("/api/v1/cluster/status")
+        resp = client.get("/api/v1/cluster/nodes")
 
-        assert resp.status_code == 200
-        leader = resp.json()["leader"]
-        assert leader["holder_id"] == "other-host:9:zzz"
-        assert leader["acquired_at"] == "2026-03-07T10:00:00Z"
-        assert leader["expires_at"] == "2026-03-07T10:00:30Z"
+        lock = resp.json()["leader_lock"]
+        assert lock["holder_id"] == "other-host:9:zzz"
+        assert lock["acquired_at"] == "2026-03-07T10:00:00Z"
+        assert lock["expires_at"] == "2026-03-07T10:00:30Z"
 
-    async def test_is_valid_true_for_unexpired_lock(self):
+    async def test_leader_lock_is_valid_true_for_unexpired_lock(self):
         acquired = _now() - timedelta(seconds=5)
         db = AsyncMock(spec=DatabaseManager)
         db.get_leader_lock_info = AsyncMock(
@@ -274,14 +411,15 @@ class TestClusterStatusResponse:
                 "lease_duration_seconds": 30,
             }
         )
+        db.get_cluster_nodes = AsyncMock(return_value=[])
         le = _make_le()
         client = _make_client(le, db, user=_admin())
 
-        resp = client.get("/api/v1/cluster/status")
+        resp = client.get("/api/v1/cluster/nodes")
 
-        assert resp.json()["leader"]["is_valid"] is True
+        assert resp.json()["leader_lock"]["is_valid"] is True
 
-    async def test_is_valid_false_for_expired_lock(self):
+    async def test_leader_lock_is_valid_false_for_expired_lock(self):
         acquired = _now() - timedelta(seconds=60)
         db = AsyncMock(spec=DatabaseManager)
         db.get_leader_lock_info = AsyncMock(
@@ -291,15 +429,15 @@ class TestClusterStatusResponse:
                 "lease_duration_seconds": 30,
             }
         )
+        db.get_cluster_nodes = AsyncMock(return_value=[])
         le = _make_le()
         client = _make_client(le, db, user=_admin())
 
-        resp = client.get("/api/v1/cluster/status")
+        resp = client.get("/api/v1/cluster/nodes")
 
-        assert resp.json()["leader"]["is_valid"] is False
+        assert resp.json()["leader_lock"]["is_valid"] is False
 
-    async def test_naive_datetime_treated_as_utc(self):
-        """A naive acquired_at from the DB is treated as UTC without raising."""
+    async def test_naive_datetime_in_lock_treated_as_utc(self):
         acquired = datetime(2026, 3, 7, 10, 0, 0)  # no tzinfo
         db = AsyncMock(spec=DatabaseManager)
         db.get_leader_lock_info = AsyncMock(
@@ -309,53 +447,166 @@ class TestClusterStatusResponse:
                 "lease_duration_seconds": 30,
             }
         )
+        db.get_cluster_nodes = AsyncMock(return_value=[])
         le = _make_le()
         client = _make_client(le, db, user=_admin())
 
-        resp = client.get("/api/v1/cluster/status")
+        resp = client.get("/api/v1/cluster/nodes")
 
         assert resp.status_code == 200
-        assert resp.json()["leader"]["acquired_at"] == "2026-03-07T10:00:00Z"
+        assert resp.json()["leader_lock"]["acquired_at"] == "2026-03-07T10:00:00Z"
 
-    async def test_db_error_returns_200_with_null_leader(self):
-        """A DB failure is swallowed; the endpoint still returns the instance state."""
+    async def test_lock_db_error_returns_null_leader_lock(self):
         db = AsyncMock(spec=DatabaseManager)
         db.get_leader_lock_info = AsyncMock(side_effect=Exception("db gone"))
+        db.get_cluster_nodes = AsyncMock(return_value=[])
         le = _make_le(is_leader=True, holder_id="this-host:1:abc")
         client = _make_client(le, db, user=_admin())
 
-        resp = client.get("/api/v1/cluster/status")
+        resp = client.get("/api/v1/cluster/nodes")
 
         assert resp.status_code == 200
-        data = resp.json()
-        assert data["leader"] is None
-        assert data["is_leader"] is True
-        assert data["instance_id"] == "this-host:1:abc"
+        assert resp.json()["leader_lock"] is None
+        assert resp.json()["this_instance_is_leader"] is True
+        assert resp.json()["this_instance_id"] == "this-host:1:abc"
 
-    async def test_different_lock_names_return_different_leader_info(self):
-        """Leader info reflects the lock row for this instance's configured lock."""
-        acquired = datetime(2026, 3, 7, 10, 0, 0, tzinfo=timezone.utc)
-        lock_row = {
-            "holder_id": "host:1:abc",
-            "acquired_at": acquired,
-            "lease_duration_seconds": 30,
-        }
 
-        db_with_lock = AsyncMock(spec=DatabaseManager)
-        db_with_lock.get_leader_lock_info = AsyncMock(return_value=lock_row)
+# ---------------------------------------------------------------------------
+# HTTP: GET /api/v1/cluster/nodes — node list content
+# ---------------------------------------------------------------------------
 
-        db_no_lock = AsyncMock(spec=DatabaseManager)
-        db_no_lock.get_leader_lock_info = AsyncMock(return_value=None)
 
+class TestClusterNodesContent:
+    async def test_empty_nodes_list(self):
+        db = AsyncMock(spec=DatabaseManager)
+        db.get_leader_lock_info = AsyncMock(return_value=None)
+        db.get_cluster_nodes = AsyncMock(return_value=[])
         le = _make_le()
-        le._config = LeaderElectionConfig(lock_name="custom-lock-name")
+        client = _make_client(le, db, user=_admin())
 
-        resp_with = _make_client(le, db_with_lock, user=_admin()).get(
-            "/api/v1/cluster/status"
-        )
-        resp_without = _make_client(le, db_no_lock, user=_admin()).get(
-            "/api/v1/cluster/status"
-        )
+        resp = client.get("/api/v1/cluster/nodes")
 
-        assert resp_with.json()["leader"]["holder_id"] == "host:1:abc"
-        assert resp_without.json()["leader"] is None
+        assert resp.status_code == 200
+        assert resp.json()["nodes"] == []
+
+    async def test_ready_node_when_heartbeat_fresh(self):
+        now = _now()
+        db = AsyncMock(spec=DatabaseManager)
+        db.get_leader_lock_info = AsyncMock(return_value=None)
+        db.get_cluster_nodes = AsyncMock(
+            return_value=[_node_row(last_heartbeat=now, lease_duration_seconds=60)]
+        )
+        le = _make_le()
+        client = _make_client(le, db, user=_admin())
+
+        resp = client.get("/api/v1/cluster/nodes")
+
+        assert resp.json()["nodes"][0]["status"] == "Ready"
+
+    async def test_not_ready_node_when_heartbeat_expired(self):
+        stale = _now() - timedelta(seconds=120)
+        db = AsyncMock(spec=DatabaseManager)
+        db.get_leader_lock_info = AsyncMock(return_value=None)
+        db.get_cluster_nodes = AsyncMock(
+            return_value=[_node_row(last_heartbeat=stale, lease_duration_seconds=60)]
+        )
+        le = _make_le()
+        client = _make_client(le, db, user=_admin())
+
+        resp = client.get("/api/v1/cluster/nodes")
+
+        assert resp.json()["nodes"][0]["status"] == "NotReady"
+
+    async def test_leader_role_assigned_to_lock_holder(self):
+        now = _now()
+        acquired = now - timedelta(seconds=5)
+        db = AsyncMock(spec=DatabaseManager)
+        db.get_leader_lock_info = AsyncMock(
+            return_value={
+                "holder_id": "host-a:1:aaa",
+                "acquired_at": acquired,
+                "lease_duration_seconds": 60,
+            }
+        )
+        db.get_cluster_nodes = AsyncMock(
+            return_value=[
+                _node_row(node_id="host-a:1:aaa", hostname="host-a"),
+                _node_row(node_id="host-b:2:bbb", hostname="host-b"),
+            ]
+        )
+        le = _make_le()
+        client = _make_client(le, db, user=_admin())
+
+        resp = client.get("/api/v1/cluster/nodes")
+
+        nodes = {n["node_id"]: n for n in resp.json()["nodes"]}
+        assert nodes["host-a:1:aaa"]["role"] == "leader"
+        assert nodes["host-b:2:bbb"]["role"] == "follower"
+
+    async def test_expired_leader_lock_gives_all_follower(self):
+        stale_acquired = _now() - timedelta(seconds=120)
+        db = AsyncMock(spec=DatabaseManager)
+        db.get_leader_lock_info = AsyncMock(
+            return_value={
+                "holder_id": "host-a:1:aaa",
+                "acquired_at": stale_acquired,
+                "lease_duration_seconds": 30,
+            }
+        )
+        db.get_cluster_nodes = AsyncMock(
+            return_value=[_node_row(node_id="host-a:1:aaa")]
+        )
+        le = _make_le()
+        client = _make_client(le, db, user=_admin())
+
+        resp = client.get("/api/v1/cluster/nodes")
+
+        assert resp.json()["nodes"][0]["role"] == "follower"
+
+    async def test_node_fields_present(self):
+        db = AsyncMock(spec=DatabaseManager)
+        db.get_leader_lock_info = AsyncMock(return_value=None)
+        db.get_cluster_nodes = AsyncMock(
+            return_value=[
+                _node_row(node_id="myhost:42:uuid", hostname="myhost", pid="42")
+            ]
+        )
+        le = _make_le()
+        client = _make_client(le, db, user=_admin())
+
+        resp = client.get("/api/v1/cluster/nodes")
+
+        node = resp.json()["nodes"][0]
+        assert node["node_id"] == "myhost:42:uuid"
+        assert node["hostname"] == "myhost"
+        assert node["pid"] == "42"
+        assert "age" in node
+        assert "first_seen" in node
+        assert "last_heartbeat" in node
+
+    async def test_nodes_db_error_returns_empty_list(self):
+        db = AsyncMock(spec=DatabaseManager)
+        db.get_leader_lock_info = AsyncMock(return_value=None)
+        db.get_cluster_nodes = AsyncMock(side_effect=Exception("db gone"))
+        le = _make_le()
+        client = _make_client(le, db, user=_admin())
+
+        resp = client.get("/api/v1/cluster/nodes")
+
+        assert resp.status_code == 200
+        assert resp.json()["nodes"] == []
+
+    async def test_naive_datetime_in_node_treated_as_utc(self):
+        """Naive datetimes from the DB are handled without raising."""
+        naive_ts = datetime(2026, 3, 1, 12, 0, 0)  # no tzinfo
+        db = AsyncMock(spec=DatabaseManager)
+        db.get_leader_lock_info = AsyncMock(return_value=None)
+        db.get_cluster_nodes = AsyncMock(
+            return_value=[_node_row(first_seen=naive_ts, last_heartbeat=naive_ts)]
+        )
+        le = _make_le()
+        client = _make_client(le, db, user=_admin())
+
+        resp = client.get("/api/v1/cluster/nodes")
+
+        assert resp.status_code == 200

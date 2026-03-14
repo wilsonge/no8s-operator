@@ -80,6 +80,8 @@ class LeaderElection:
                 await asyncio.sleep(self._config.retry_interval_seconds)
                 continue
 
+            await self._heartbeat_node()
+
             if acquired:
                 if not self._is_leader:
                     # Newly became leader
@@ -118,6 +120,26 @@ class LeaderElection:
                 logger.info("Released leader lock (holder_id=%s)", self._holder_id)
             except Exception as exc:
                 logger.error("Failed to release leader lock: %s", exc)
+        try:
+            await self._db.deregister_node(self._holder_id)
+            logger.info("Deregistered node (holder_id=%s)", self._holder_id)
+        except Exception as exc:
+            logger.error("Failed to deregister node: %s", exc)
+
+    async def _heartbeat_node(self) -> None:
+        """Register or renew this node's presence in the cluster_nodes table."""
+        parts = self._holder_id.split(":", 2)
+        hostname = parts[0]
+        pid = parts[1] if len(parts) > 1 else ""
+        try:
+            await self._db.register_node(
+                node_id=self._holder_id,
+                hostname=hostname,
+                pid=pid,
+                lease_duration_seconds=self._config.lease_duration_seconds,
+            )
+        except Exception as exc:
+            logger.warning("Failed to register node heartbeat: %s", exc)
 
     async def _stop_leading(self, on_stopped_leading: Callable[[], Coroutine]) -> None:
         """Cancel the leading task and invoke the stopped-leading callback."""

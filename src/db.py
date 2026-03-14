@@ -1717,3 +1717,47 @@ class DatabaseManager:
                 resource_key,
             )
             return dict(row) if row else None
+
+    async def register_node(
+        self,
+        node_id: str,
+        hostname: str,
+        pid: str,
+        lease_duration_seconds: int,
+    ) -> None:
+        """Register or renew a cluster node heartbeat."""
+        self._ensure_connected()
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO cluster_nodes
+                    (node_id, hostname, pid, first_seen, last_heartbeat, lease_duration_seconds)
+                VALUES ($1, $2, $3, NOW(), NOW(), $4)
+                ON CONFLICT (node_id) DO UPDATE
+                  SET last_heartbeat = NOW(),
+                      lease_duration_seconds = $4
+                """,
+                node_id,
+                hostname,
+                pid,
+                lease_duration_seconds,
+            )
+
+    async def get_cluster_nodes(self) -> List[Dict[str, Any]]:
+        """Return all known cluster nodes ordered by first registration."""
+        self._ensure_connected()
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT node_id, hostname, pid, first_seen, last_heartbeat, "
+                "lease_duration_seconds FROM cluster_nodes ORDER BY first_seen ASC"
+            )
+            return [dict(row) for row in rows]
+
+    async def deregister_node(self, node_id: str) -> None:
+        """Remove a node from the cluster registry on graceful shutdown."""
+        self._ensure_connected()
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM cluster_nodes WHERE node_id = $1",
+                node_id,
+            )
