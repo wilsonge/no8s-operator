@@ -12,7 +12,7 @@ dependencies = [
     "uvicorn[standard]==0.40.0",
     "pydantic==2.12.5",
     # Async utilities
-    "aiohttp==3.11.12",
+    "aiohttp==3.13.3",
     # Schema validation
     "jsonschema==4.26.0",
     # Auth
