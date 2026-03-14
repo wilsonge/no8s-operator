@@ -8,15 +8,58 @@ points and run their own continuous reconciliation loops.
 
 import asyncio
 import logging
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from datetime import datetime
+from typing import Any, Dict, List, Optional, TypedDict
 
 from db import DatabaseManager, ResourceStatus
 from plugins.actions.base import ActionPlugin
 from plugins.registry import PluginRegistry
 
 logger = logging.getLogger(__name__)
+
+
+class ResourceRecord(TypedDict, total=False):
+    """
+    Typed representation of a resource dict returned by
+    ReconcilerContext.get_resources_needing_reconciliation().
+
+    All fields are always present; `total=False` is used only so that
+    subsets can be constructed in tests without filling every key.
+    """
+
+    id: int
+    name: str
+    resource_type_name: str
+    resource_type_version: str
+    # The action plugin name linked to this resource (empty string if none).
+    action_plugin: str
+    # Desired end-state declared by the resource owner.
+    spec: Dict[str, Any]
+    # Backend-specific configuration for the action plugin (credentials,
+    # repository name, workflow ID, etc.).  Reconcilers that call the
+    # provider API directly rather than via an action plugin will
+    # typically ignore this field.
+    plugin_config: Dict[str, Any]
+    metadata: Dict[str, Any]
+    # Current phase — one of the ResourceStatus string values:
+    # "pending", "reconciling", "ready", "failed", "deleting".
+    status: str
+    generation: int
+    observed_generation: int
+    status_message: str
+    conditions: List[Dict[str, Any]]
+    finalizers: List[str]
+    spec_hash: str
+    outputs: Dict[str, Any]
+    created_at: datetime
+    updated_at: datetime
+    deleted_at: Optional[datetime]
+    last_reconcile_time: Optional[datetime]
+    next_reconcile_time: Optional[datetime]
+    retry_count: int
 
 
 @dataclass
@@ -60,6 +103,7 @@ class ReconcilerContext:
 
         Returns:
             List of resource dicts needing reconciliation.
+            Each dict conforms to the ResourceRecord TypedDict shape.
         """
         return await self.db.get_resources_needing_reconciliation_by_type(
             resource_type_names=resource_type_names,
@@ -142,6 +186,10 @@ class ReconcilerContext:
         """
         Record a reconciliation attempt in history.
 
+        If result.requeue_after is set, the resource is scheduled for
+        re-reconciliation after that many seconds (equivalent to
+        ctrl.Result{RequeueAfter: d} in controller-runtime).
+
         Args:
             resource_id: The resource ID.
             result: The ReconcileResult from reconciliation.
@@ -158,6 +206,24 @@ class ReconcilerContext:
             trigger_reason=trigger_reason,
             drift_detected=drift_detected,
         )
+        if result.requeue_after is not None:
+            await self.db.mark_resource_for_reconciliation(
+                resource_id, delay_seconds=result.requeue_after
+            )
+
+    async def add_finalizer(self, resource_id: int, finalizer: str) -> None:
+        """
+        Add a finalizer to a resource.
+
+        Call this during reconciliation to register a cleanup obligation.
+        The resource cannot be hard-deleted until this finalizer is removed
+        via remove_finalizer().  No-op if the finalizer already exists.
+
+        Args:
+            resource_id: The resource ID.
+            finalizer: Finalizer name to add (typically self.name).
+        """
+        await self.db.add_finalizer(resource_id, finalizer)
 
     async def remove_finalizer(self, resource_id: int, finalizer: str) -> None:
         """
@@ -192,6 +258,23 @@ class ReconcilerContext:
             True if deleted, False otherwise.
         """
         return await self.db.hard_delete_resource(resource_id)
+
+    async def update_outputs(self, resource_id: int, outputs: Dict[str, Any]) -> None:
+        """
+        Store output values on a resource.
+
+        Outputs are returned in every GET /api/v1/resources/{id} response
+        under the 'outputs' key, making them available to downstream consumers
+        without requiring direct database access.  Use this to publish values
+        produced during reconciliation, such as connection strings, endpoints,
+        or allocated identifiers.
+
+        Args:
+            resource_id: The resource ID.
+            outputs: Dict of output key-value pairs.  Replaces the existing
+                     outputs dict entirely on each call.
+        """
+        await self.db.update_resource_outputs(resource_id, outputs)
 
 
 class ReconcilerPlugin(ABC):
@@ -243,7 +326,8 @@ class ReconcilerPlugin(ABC):
         Report status back via ctx.update_status().
 
         Args:
-            resource: The resource dict from the cache.
+            resource: The resource record from the operator cache.
+                      See ResourceRecord for all available fields.
             ctx: ReconcilerContext for status updates and action plugins.
 
         Returns:
@@ -254,4 +338,68 @@ class ReconcilerPlugin(ABC):
     @abstractmethod
     async def stop(self) -> None:
         """Graceful shutdown. Clean up any resources."""
+        pass
+
+
+class BaseReconciler(ReconcilerPlugin):
+    """
+    Convenience base class that provides the standard reconciliation loop.
+
+    Subclass this instead of ReconcilerPlugin when you want the canonical
+    fetch → reconcile → record pattern handled for you.  Only reconcile()
+    needs to be implemented; stop() has a no-op default.
+
+    The loop interval defaults to 30 seconds.  Override the class attribute
+    to change it::
+
+        class MyReconciler(BaseReconciler):
+            reconcile_interval = 60
+
+    Per-resource exceptions are caught and recorded as failures so that one
+    bad resource does not skip the rest of the batch.  Loop-level exceptions
+    (e.g. database connectivity loss) are also caught and logged; the loop
+    resumes after the next interval.
+    """
+
+    reconcile_interval: int = 30
+
+    async def start(self, ctx: ReconcilerContext) -> None:
+        logger.info(f"{self.name} reconciler started")
+        while not ctx.shutdown_event.is_set():
+            try:
+                resources = await ctx.get_resources_needing_reconciliation(
+                    resource_type_names=self.resource_types,
+                )
+                for resource in resources:
+                    if ctx.shutdown_event.is_set():
+                        break
+                    start_time = time.monotonic()
+                    try:
+                        result = await self.reconcile(resource, ctx)
+                    except Exception as exc:
+                        logger.exception(
+                            f"{self.name}: unhandled error reconciling "
+                            f"resource {resource['id']}"
+                        )
+                        result = ReconcileResult(success=False, message=str(exc))
+                    await ctx.record_reconciliation(
+                        resource_id=resource["id"],
+                        result=result,
+                        duration_seconds=time.monotonic() - start_time,
+                    )
+            except Exception:
+                logger.exception(f"{self.name}: error in reconcile loop")
+
+            try:
+                await asyncio.wait_for(
+                    ctx.shutdown_event.wait(),
+                    timeout=float(self.reconcile_interval),
+                )
+                break  # shutdown_event was set
+            except asyncio.TimeoutError:
+                continue
+
+        logger.info(f"{self.name} reconciler stopped")
+
+    async def stop(self) -> None:
         pass

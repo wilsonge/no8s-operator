@@ -32,10 +32,14 @@ class ControllerConfig:
     max_concurrent_reconciles: int = 5
     plugin_configs: Optional[Dict[str, Dict[str, Any]]] = None
 
-    # Exponential backoff configuration
+    # Exponential backoff configuration (for failed resources)
     backoff_base_delay: int = 60  # base delay in seconds
     backoff_max_delay: int = 3600  # max delay in seconds (1 hour)
     backoff_jitter_factor: float = 0.1  # ±10% jitter
+
+    # Reconciler plugin crash restart configuration
+    reconciler_restart_base_delay: int = 5  # seconds before first restart
+    reconciler_restart_max_delay: int = 300  # cap at 5 minutes
 
     def __post_init__(self):
         if self.plugin_configs is None:
@@ -149,14 +153,43 @@ class Controller:
             logger.info(f"Started reconciler plugin: {reconciler_name}")
 
     async def _run_reconciler(self, reconciler: Any, ctx: ReconcilerContext) -> None:
-        """Run a reconciler plugin, catching exceptions."""
-        try:
-            await reconciler.start(ctx)
-        except Exception as e:
-            logger.error(
-                f"Reconciler plugin '{reconciler.name}' crashed: {e}",
-                exc_info=True,
-            )
+        """
+        Run a reconciler plugin, restarting it with exponential backoff if it crashes.
+
+        A clean exit (start() returning normally after shutdown_event is set) does
+        not trigger a restart.  Crashes during shutdown are also not restarted.
+
+        Backoff: 5s, 10s, 20s, 40s … capped at reconciler_restart_max_delay.
+        """
+        restart_count = 0
+        while not ctx.shutdown_event.is_set():
+            try:
+                await reconciler.start(ctx)
+                return  # clean shutdown
+            except Exception as e:
+                if ctx.shutdown_event.is_set():
+                    return
+                restart_count += 1
+                delay = min(
+                    self.config.reconciler_restart_base_delay
+                    * (2 ** (restart_count - 1)),
+                    self.config.reconciler_restart_max_delay,
+                )
+                logger.error(
+                    f"Reconciler plugin '{reconciler.name}' crashed "
+                    f"(restart #{restart_count}, retrying in {delay}s): {e}",
+                    exc_info=True,
+                )
+                try:
+                    await asyncio.wait_for(
+                        ctx.shutdown_event.wait(), timeout=float(delay)
+                    )
+                    return  # shutdown signalled during backoff
+                except asyncio.TimeoutError:
+                    logger.info(
+                        f"Restarting reconciler plugin '{reconciler.name}' "
+                        f"(attempt #{restart_count + 1})"
+                    )
 
     async def _stop_reconcilers(self) -> None:
         """Stop all running reconciler plugins."""

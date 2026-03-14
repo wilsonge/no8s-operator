@@ -300,11 +300,13 @@ The `ReconcilerContext` is your interface back into the operator — similar to 
 | `get_resources_needing_reconciliation(resource_type_names, limit)` | Informer work queue | Fetch resources where `generation > observed_generation`, status is `pending`/`failed`/`deleting`, or the drift detection window has elapsed |
 | `update_status(resource_id, status, message, observed_generation)` | `Status().Update()` | Set `status` to `pending`, `reconciling`, `ready`, `failed`, or `deleting`. Set `observed_generation` on success to acknowledge the spec |
 | `set_condition(resource_id, condition_type, status, reason, message, observed_generation)` | `meta.SetStatusCondition()` | Set a named condition on the resource. `status` is `"True"`, `"False"`, or `"Unknown"`. `lastTransitionTime` is only updated when `status` changes |
-| `record_reconciliation(resource_id, result, ...)` | Event recorder | Write an entry to the reconciliation history audit log |
+| `record_reconciliation(resource_id, result, ...)` | Event recorder | Write an entry to the reconciliation history audit log. If `result.requeue_after` is set, also schedules the resource for re-reconciliation after that many seconds |
 | `get_action_plugin(name)` | N/A (no8s-specific) | Get an action plugin instance to delegate execution (e.g. trigger a GitHub Actions workflow) |
+| `add_finalizer(resource_id, finalizer)` | Patch to add finalizer string | Add a finalizer to the resource's JSONB array. No-op if it already exists. Call this when your reconciler first provisions external resources |
 | `remove_finalizer(resource_id, finalizer)` | Patch to remove finalizer string | Remove a finalizer from the resource's JSONB array |
 | `get_finalizers(resource_id)` | Read `metadata.finalizers` | List current finalizers |
 | `hard_delete_resource(resource_id)` | N/A (API server does this) | Permanently delete a resource. Only succeeds if the resource is soft-deleted and has zero finalizers |
+| `update_outputs(resource_id, outputs)` | N/A (no8s-specific) | Store reconciliation outputs (e.g. connection strings, endpoints) on the resource. Returned in every `GET /api/v1/resources/{id}` response under the `outputs` key |
 
 ## ReconcileResult
 
@@ -317,6 +319,22 @@ class ReconcileResult:
     message: str = ""               # Human-readable status message
     requeue_after: Optional[int] = None  # Re-reconcile after N seconds (like ctrl.Result{RequeueAfter})
 ```
+
+### Using requeue_after
+
+When you return `requeue_after`, the operator schedules the resource to be reconciled again after that many seconds. This is equivalent to `ctrl.Result{RequeueAfter: d}` in controller-runtime. It works regardless of whether reconciliation succeeded or failed.
+
+```python
+async def reconcile(self, resource, ctx):
+    # Provisioning is async — check back in 30 seconds
+    if resource["status"] == "reconciling" and not provisioning_complete:
+        return ReconcileResult(success=True, message="Waiting for provisioning", requeue_after=30)
+
+    # Trigger re-check for drift every 5 minutes
+    return ReconcileResult(success=True, message="Ready", requeue_after=300)
+```
+
+`requeue_after` is processed when you call `ctx.record_reconciliation()` — the resource's `next_reconcile_time` is set to `now + requeue_after seconds`. If you do not call `record_reconciliation()`, you must schedule the requeue yourself by calling `ctx.db.mark_resource_for_reconciliation(resource_id, delay_seconds=N)` directly.
 
 ## Resource Lifecycle
 
@@ -495,6 +513,142 @@ ValueError: Resource type 'DnsRecord' is already claimed by reconciler 'dns_reco
 ```
 
 This is analogous to Kubernetes preventing two controllers from watching the same GVK with conflicting logic — except no8s enforces it at registration time.
+
+## Using BaseReconciler
+
+If your reconciler follows the standard fetch → reconcile → record pattern, subclass `BaseReconciler` instead of `ReconcilerPlugin`.  It provides a `start()` implementation so you only need to implement `name`, `resource_types`, and `reconcile()`:
+
+```python
+from no8s_operator.plugins.reconcilers.base import BaseReconciler, ReconcilerContext, ReconcileResult
+
+class DatabaseClusterReconciler(BaseReconciler):
+    reconcile_interval = 30  # seconds between loop iterations (default: 30)
+
+    @property
+    def name(self) -> str:
+        return "database_cluster"
+
+    @property
+    def resource_types(self) -> list[str]:
+        return ["DatabaseCluster"]
+
+    async def reconcile(self, resource, ctx: ReconcilerContext) -> ReconcileResult:
+        # Your logic here — BaseReconciler handles the loop, error isolation,
+        # and record_reconciliation() for you.
+        ...
+        return ReconcileResult(success=True, message="Cluster ready")
+```
+
+`BaseReconciler` provides:
+- **Per-resource exception isolation** — a crash in `reconcile()` for resource A is caught, recorded as a failure, and the loop continues with resource B.
+- **Loop-level exception isolation** — database connectivity errors or other loop-level failures are caught and logged; the loop resumes after the next interval.
+- **Interruptible sleep** — the interval wait responds to the shutdown event immediately rather than blocking until the sleep expires.
+
+Use `ReconcilerPlugin` directly (and implement `start()` yourself) only if you need non-standard loop behaviour, such as event-driven reconciliation or batching strategies.
+
+## Crash and Restart Behaviour
+
+The operator automatically restarts a reconciler plugin if its `start()` method raises an unhandled exception.  Restarts use exponential backoff:
+
+```
+restart #1: wait  5s
+restart #2: wait 10s
+restart #3: wait 20s
+restart #4: wait 40s
+...
+capped at 5 minutes
+```
+
+The restart counter resets to zero only when `start()` returns cleanly (i.e. after the shutdown event is set).  A reconciler that crashes repeatedly will keep being restarted until the operator is stopped.
+
+**Implication for plugin authors:** you do not need to add an outer retry loop inside `start()`.  However, you should still handle *expected* transient errors (e.g. `asyncio.TimeoutError` on an external API call) inside `reconcile()` so they are recorded as per-resource failures rather than crashing the whole reconciler.
+
+The restart delay is configurable via `ControllerConfig.reconciler_restart_base_delay` and `reconciler_restart_max_delay`.
+
+## Publishing Outputs
+
+After provisioning external resources, publish the connection details so consumers can retrieve them without querying the underlying infrastructure:
+
+```python
+async def reconcile(self, resource, ctx: ReconcilerContext) -> ReconcileResult:
+    # ... provision the database ...
+    endpoint = "db-1234.internal:5432"
+
+    await ctx.update_outputs(resource["id"], {
+        "endpoint": endpoint,
+        "port": 5432,
+        "database": resource["spec"]["database_name"],
+    })
+
+    await ctx.update_status(resource["id"], "ready",
+                            message=f"Cluster available at {endpoint}",
+                            observed_generation=resource["generation"])
+    return ReconcileResult(success=True, message="Ready")
+```
+
+Outputs appear in every `GET /api/v1/resources/{id}` response under the `outputs` key.  Calling `update_outputs()` replaces the stored outputs dict entirely, so always pass the full set.
+
+## spec vs plugin_config
+
+Every resource carries two JSON fields. Understanding the difference is important when designing your resource schema:
+
+| Field | Purpose | Who owns it |
+|---|---|---|
+| `spec` | **Desired end-state** of the managed resource (e.g. `engine`, `version`, `storage_gb`). This is the source of truth your reconciler works toward. | The resource owner (user or automation) |
+| `plugin_config` | **Action plugin configuration** — backend-specific settings such as a GitHub repository name, workflow ID, AWS region, or Terraform backend URL. Reconcilers that call provider APIs directly rather than via an action plugin will typically leave this empty. | The operator administrator |
+
+A database reconciler that calls the cloud provider API directly only uses `spec`:
+
+```python
+async def reconcile(self, resource, ctx):
+    spec = resource["spec"]
+    engine = spec["engine"]       # "postgres"
+    version = spec["version"]     # "15"
+    storage_gb = spec["storage_gb"]
+    # ... call cloud API with these values
+```
+
+A reconciler that delegates to an action plugin (e.g. a Terraform runner) reads `plugin_config` to know how to configure the plugin backend:
+
+```python
+async def reconcile(self, resource, ctx):
+    spec = resource["spec"]            # desired DB state
+    cfg = resource["plugin_config"]    # {"tf_backend_bucket": "...", "aws_region": "..."}
+    runner = await ctx.get_action_plugin("terraform")
+    # runner is initialised with plugin_config by the operator
+```
+
+## ResourceRecord
+
+Resources returned by `get_resources_needing_reconciliation()` are typed as `ResourceRecord`. Import it for type annotations:
+
+```python
+from no8s_operator.plugins.reconcilers.base import ResourceRecord
+
+async def reconcile(self, resource: ResourceRecord, ctx: ReconcilerContext) -> ReconcileResult:
+    resource_id: int = resource["id"]
+    spec: dict = resource["spec"]
+    status: str = resource["status"]   # "pending", "reconciling", "ready", "failed", "deleting"
+    generation: int = resource["generation"]
+    finalizers: list[str] = resource["finalizers"]
+```
+
+Key fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | `int` | Unique resource ID |
+| `name` | `str` | Resource name |
+| `resource_type_name` | `str` | e.g. `"DatabaseCluster"` |
+| `spec` | `dict` | Desired state |
+| `plugin_config` | `dict` | Action plugin configuration |
+| `status` | `str` | Current phase string (`"pending"`, `"ready"`, etc.) |
+| `generation` | `int` | Incremented on every spec change |
+| `observed_generation` | `int` | Last generation your reconciler acknowledged |
+| `spec_hash` | `str` | SHA-256 of `spec` — use for drift detection |
+| `finalizers` | `list[str]` | Active finalizer names |
+| `outputs` | `dict` | Values written by the action plugin after apply |
+| `conditions` | `list[dict]` | Kubernetes-style condition objects |
 
 ## Tips
 

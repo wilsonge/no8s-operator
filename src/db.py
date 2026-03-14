@@ -963,16 +963,26 @@ class DatabaseManager:
                 return []
             return json.loads(result) if isinstance(result, str) else result
 
-    async def mark_resource_for_reconciliation(self, resource_id: int):
-        """Manually trigger reconciliation for a resource."""
+    async def mark_resource_for_reconciliation(
+        self, resource_id: int, delay_seconds: int = 0
+    ):
+        """
+        Trigger reconciliation for a resource, optionally after a delay.
+
+        Args:
+            resource_id: The resource ID.
+            delay_seconds: Seconds from now to schedule the reconciliation.
+                           0 means immediately (next reconcile loop pass).
+        """
         async with self.pool.acquire() as conn:
             await conn.execute(
                 """
                 UPDATE resources
-                SET next_reconcile_time = NOW()
+                SET next_reconcile_time = NOW() + INTERVAL '1 second' * $2
                 WHERE id = $1
                 """,
                 resource_id,
+                delay_seconds,
             )
 
     async def update_resource_outputs(

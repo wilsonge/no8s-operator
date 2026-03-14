@@ -9,6 +9,7 @@ import pytest
 from controller import Controller, ControllerConfig
 from db import ResourceStatus
 from plugins.reconcilers.base import (
+    BaseReconciler,
     ReconcilerPlugin,
     ReconcilerContext,
     ReconcileResult,
@@ -133,9 +134,11 @@ class TestReconcilerContext:
         db.get_resources_needing_reconciliation_by_type = AsyncMock(return_value=[])
         db.update_resource_status = AsyncMock()
         db.record_reconciliation = AsyncMock()
+        db.add_finalizer = AsyncMock()
         db.remove_finalizer = AsyncMock()
         db.get_finalizers = AsyncMock(return_value=[])
         db.hard_delete_resource = AsyncMock(return_value=True)
+        db.mark_resource_for_reconciliation = AsyncMock()
         return db
 
     @pytest.fixture
@@ -268,11 +271,211 @@ class TestReconcilerContext:
         mock_db.hard_delete_resource.assert_called_once_with(1)
         assert result is True
 
+    async def test_add_finalizer(self, ctx, mock_db):
+        """Test add_finalizer delegates to DB."""
+        await ctx.add_finalizer(1, "database_cluster")
+        mock_db.add_finalizer.assert_called_once_with(1, "database_cluster")
+
+    async def test_record_reconciliation_with_requeue_after(self, ctx, mock_db):
+        """Test that requeue_after schedules re-reconciliation."""
+        result = ReconcileResult(success=True, message="Wait", requeue_after=60)
+
+        await ctx.record_reconciliation(resource_id=1, result=result)
+
+        mock_db.record_reconciliation.assert_called_once()
+        mock_db.mark_resource_for_reconciliation.assert_called_once_with(
+            1, delay_seconds=60
+        )
+
+    async def test_record_reconciliation_without_requeue_after(self, ctx, mock_db):
+        """Test that no requeue is scheduled when requeue_after is None."""
+        result = ReconcileResult(success=True, message="Done")
+
+        await ctx.record_reconciliation(resource_id=1, result=result)
+
+        mock_db.record_reconciliation.assert_called_once()
+        mock_db.mark_resource_for_reconciliation.assert_not_called()
+
+    async def test_record_reconciliation_requeue_after_zero(self, ctx, mock_db):
+        """Test that requeue_after=0 is treated as immediate (not skipped)."""
+        result = ReconcileResult(success=True, message="Immediate", requeue_after=0)
+
+        await ctx.record_reconciliation(resource_id=1, result=result)
+
+        mock_db.mark_resource_for_reconciliation.assert_called_once_with(
+            1, delay_seconds=0
+        )
+
+    async def test_update_outputs(self, ctx, mock_db):
+        """Test update_outputs delegates to DB."""
+        mock_db.update_resource_outputs = AsyncMock()
+        outputs = {"endpoint": "db.example.com:5432", "port": 5432}
+
+        await ctx.update_outputs(1, outputs)
+
+        mock_db.update_resource_outputs.assert_called_once_with(1, outputs)
+
     async def test_shutdown_event(self, ctx):
         """Test that the shutdown event is accessible."""
         assert not ctx.shutdown_event.is_set()
         ctx.shutdown_event.set()
         assert ctx.shutdown_event.is_set()
+
+
+# ==================== BaseReconciler Tests ====================
+
+
+class TestBaseReconcilerSync:
+    """Synchronous tests for BaseReconciler."""
+
+    def test_cannot_instantiate_without_required_methods(self):
+        """BaseReconciler still requires name, resource_types, and reconcile."""
+        with pytest.raises(TypeError):
+            BaseReconciler()
+
+    def test_concrete_subclass_can_be_instantiated(self):
+        """A concrete subclass only needs name, resource_types, and reconcile."""
+
+        class MyReconciler(BaseReconciler):
+            @property
+            def name(self):
+                return "my_reconciler"
+
+            @property
+            def resource_types(self):
+                return ["MyResource"]
+
+            async def reconcile(self, resource, ctx):
+                return ReconcileResult(success=True)
+
+        r = MyReconciler()
+        assert r.name == "my_reconciler"
+
+    def test_reconcile_interval_is_overridable(self):
+        """reconcile_interval class attribute can be overridden."""
+
+        class FastReconciler(BaseReconciler):
+            reconcile_interval = 5
+
+            @property
+            def name(self):
+                return "fast"
+
+            @property
+            def resource_types(self):
+                return ["X"]
+
+            async def reconcile(self, resource, ctx):
+                return ReconcileResult(success=True)
+
+        assert FastReconciler.reconcile_interval == 5
+        assert FastReconciler().reconcile_interval == 5
+
+
+@pytest.mark.asyncio
+class TestBaseReconcilerAsync:
+    """Async tests for BaseReconciler."""
+
+    @pytest.fixture
+    def mock_db(self):
+        db = AsyncMock()
+        db.get_resources_needing_reconciliation_by_type = AsyncMock(return_value=[])
+        db.record_reconciliation = AsyncMock()
+        db.mark_resource_for_reconciliation = AsyncMock()
+        return db
+
+    @pytest.fixture
+    def mock_registry(self):
+        return MagicMock()
+
+    def _make_ctx(self, mock_db, mock_registry, shutdown_event=None):
+        return ReconcilerContext(
+            db=mock_db,
+            registry=mock_registry,
+            shutdown_event=shutdown_event or asyncio.Event(),
+        )
+
+    async def test_start_calls_reconcile_for_each_resource(
+        self, mock_db, mock_registry
+    ):
+        """start() calls reconcile() for every resource in the batch."""
+        resources = [{"id": 1, "name": "r1"}, {"id": 2, "name": "r2"}]
+        mock_db.get_resources_needing_reconciliation_by_type.return_value = resources
+
+        reconciled_ids = []
+        shutdown_event = asyncio.Event()
+
+        class TrackingReconciler(BaseReconciler):
+            reconcile_interval = 0
+
+            @property
+            def name(self):
+                return "tracker"
+
+            @property
+            def resource_types(self):
+                return ["MyResource"]
+
+            async def reconcile(self, resource, ctx):
+                reconciled_ids.append(resource["id"])
+                if resource["id"] == 2:
+                    # Shut down after processing the last resource in the batch
+                    shutdown_event.set()
+                return ReconcileResult(success=True)
+
+        ctx = self._make_ctx(mock_db, mock_registry, shutdown_event)
+        await TrackingReconciler().start(ctx)
+
+        assert reconciled_ids == [1, 2]
+
+    async def test_start_isolates_per_resource_exceptions(self, mock_db, mock_registry):
+        """A failing reconcile() for one resource doesn't skip the others."""
+        resources = [{"id": 1, "name": "bad"}, {"id": 2, "name": "good"}]
+        mock_db.get_resources_needing_reconciliation_by_type.return_value = resources
+
+        reconciled_ids = []
+        shutdown_event = asyncio.Event()
+
+        class FaultyReconciler(BaseReconciler):
+            reconcile_interval = 0
+
+            @property
+            def name(self):
+                return "faulty"
+
+            @property
+            def resource_types(self):
+                return ["MyResource"]
+
+            async def reconcile(self, resource, ctx):
+                reconciled_ids.append(resource["id"])
+                if resource["id"] == 1:
+                    raise RuntimeError("simulated failure")
+                shutdown_event.set()
+                return ReconcileResult(success=True)
+
+        ctx = self._make_ctx(mock_db, mock_registry, shutdown_event)
+        await FaultyReconciler().start(ctx)
+
+        # Both resources were attempted despite the first one raising
+        assert reconciled_ids == [1, 2]
+
+    async def test_stop_is_noop_by_default(self):
+        """BaseReconciler.stop() returns without error."""
+
+        class SimpleReconciler(BaseReconciler):
+            @property
+            def name(self):
+                return "simple"
+
+            @property
+            def resource_types(self):
+                return ["X"]
+
+            async def reconcile(self, resource, ctx):
+                return ReconcileResult(success=True)
+
+        await SimpleReconciler().stop()
 
 
 # ==================== PluginRegistry Reconciler Tests ====================
@@ -627,28 +830,69 @@ class TestControllerReconcilerIntegration:
 
     async def test_reconciler_crash_is_caught(self, mock_db, mock_registry):
         """Test that a crashing reconciler doesn't take down the controller."""
-        mock_reconciler = AsyncMock()
+        shutdown_event = asyncio.Event()
+
+        async def crashing_start(ctx):
+            # Set shutdown so the restart loop exits after the first crash.
+            ctx.shutdown_event.set()
+            raise Exception("Reconciler crash!")
+
+        mock_reconciler = MagicMock()
         mock_reconciler.name = "crasher"
-        mock_reconciler.start = AsyncMock(side_effect=Exception("Reconciler crash!"))
-
-        mock_registry.list_reconciler_plugins.return_value = ["crasher"]
-        mock_registry.get_reconciler_plugin.return_value = mock_reconciler
-
-        config = ControllerConfig(reconcile_interval=1)
-        controller = Controller(
-            db_manager=mock_db,
-            registry=mock_registry,
-            config=config,
-        )
+        mock_reconciler.start = crashing_start
 
         ctx = ReconcilerContext(
             db=mock_db,
             registry=mock_registry,
-            shutdown_event=asyncio.Event(),
+            shutdown_event=shutdown_event,
+        )
+
+        config = ControllerConfig(reconcile_interval=1, reconciler_restart_base_delay=0)
+        controller = Controller(
+            db_manager=mock_db, registry=mock_registry, config=config
         )
 
         # Should not raise
         await controller._run_reconciler(mock_reconciler, ctx)
+
+    async def test_reconciler_crash_triggers_restart(self, mock_db, mock_registry):
+        """Test that a crashed reconciler is restarted automatically."""
+        shutdown_event = asyncio.Event()
+        call_count = 0
+
+        async def flaky_start(ctx):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise Exception("Temporary failure")
+            # Second call: clean exit via shutdown
+            await ctx.shutdown_event.wait()
+
+        mock_reconciler = MagicMock()
+        mock_reconciler.name = "flaky"
+        mock_reconciler.start = flaky_start
+
+        ctx = ReconcilerContext(
+            db=mock_db,
+            registry=mock_registry,
+            shutdown_event=shutdown_event,
+        )
+
+        config = ControllerConfig(reconcile_interval=1, reconciler_restart_base_delay=0)
+        controller = Controller(
+            db_manager=mock_db, registry=mock_registry, config=config
+        )
+
+        # Drive the restart: let it crash, restart, then shut down.
+        async def stop_after_restart():
+            # Yield until after the restart is underway
+            for _ in range(10):
+                await asyncio.sleep(0)
+            shutdown_event.set()
+
+        asyncio.create_task(stop_after_restart())
+        await controller._run_reconciler(mock_reconciler, ctx)
+        assert call_count == 2
 
     async def test_no_reconcilers_registered(self, controller, mock_registry):
         """Test controller works normally with no reconcilers."""
