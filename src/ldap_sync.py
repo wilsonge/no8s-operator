@@ -1,9 +1,8 @@
 """
-LDAP integration: user search, authentication, and DB sync.
+LDAP Sync - Optional LDAP integration for syncing users from a directory.
 
-LDAP support is entirely optional — if LDAP_URL is not set the
-LDAPSyncManager is still safe to construct and use (is_configured()
-returns False).
+If LDAP_URL is not set the LDAPSyncManager is still safe to construct and use
+(is_configured() returns False).
 """
 
 import logging

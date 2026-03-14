@@ -1,8 +1,8 @@
 """
-Operator Controller - Main reconciliation loop.
+Main Loop - Receives resource events, caches state, and dispatches to reconciler plugins.
 
-Similar to Kubernetes controllers, continuously reconciles desired state with actual state.
-Uses a plugin architecture for extensibility.
+Manages resource lifecycle, status tracking, and audit history. Starts and stops reconciler
+plugin loops alongside its own main loop.
 """
 
 import asyncio

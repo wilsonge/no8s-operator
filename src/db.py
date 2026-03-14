@@ -1,7 +1,5 @@
 """
-Database Manager - PostgreSQL schema and operations.
-
-Stores resource definitions, reconciliation history, and metadata.
+Database Manager - PostgreSQL operations for resource definitions, cached state, and metadata.
 """
 
 import asyncpg

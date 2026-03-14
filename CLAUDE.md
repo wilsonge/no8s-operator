@@ -48,16 +48,6 @@ The system follows a delegated controller pattern inspired by Kubernetes:
     └──────────┘
 ```
 
-### Components
-
-1. **Main Loop (`controller.py`)** - Receives resource events, caches state, dispatches to reconciler plugins. Manages lifecycle, status tracking, and audit history.
-2. **Database Manager (`db.py`)** - PostgreSQL operations for resource definitions, cached state, and metadata.
-3. **Auth Manager (`auth.py`)** - JWT creation/validation, bcrypt password hashing, FastAPI dependency functions for RBAC, custom role permission checks.
-4. **LDAP Sync (`ldap_sync.py`)** - Optional LDAP integration for syncing users from a directory.
-5. **Input Plugins** - Pluggable event sources. Currently: **HTTP API (`plugins/inputs/http/`)**.
-6. **Reconciler Plugins** - 3rd party pip packages discovered via entry points, owning reconciliation logic per resource type.
-7. **Action Plugins** - Optional executors for reconcilers. Currently: **GitHub Actions (`plugins/actions/github_actions/`)**.
-
 ## Plugin Architecture
 
 Three plugin types: **input plugins** (event sources), **reconciler plugins** (reconciliation per resource type), and **action plugins** (optional executors).
@@ -85,12 +75,6 @@ Optional executors available to reconcilers:
 - **GitHub Actions** (implemented) - Trigger workflows and monitor completion
 - **GitLab Pipelines** (planned)
 - **HTTP API** (planned)
-
-## Resource Types
-
-Resource types define schemas using OpenAPI v3 JSON Schema (similar to Kubernetes CRDs). All resources must reference a resource type; specs are validated against the schema. Resource types support versioning — each version can have a different schema.
-
-See [`docs/resource-types.md`](docs/resource-types.md) for the API reference.
 
 ## Reconciliation Flow
 

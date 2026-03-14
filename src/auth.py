@@ -1,8 +1,6 @@
 """
-Authentication and authorisation utilities.
-
-Provides JWT token creation/validation and FastAPI dependency functions
-for role-based access control.
+Auth Manager - JWT creation/validation, bcrypt password hashing, FastAPI dependency functions
+for RBAC, and custom role permission checks.
 """
 
 import logging
