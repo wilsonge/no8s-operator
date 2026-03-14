@@ -12,3 +12,6 @@ __pycache__/
 
 # Tests
 .coverage
+
+# Deployment secrets and generated files
+deploy

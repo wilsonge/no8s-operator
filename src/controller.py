@@ -382,6 +382,8 @@ class Controller:
                         resource_id,
                         ResourceStatus.FAILED,
                         message=error_msg,
+                        backoff_base_delay=self.config.backoff_base_delay,
+                        backoff_max_delay=self.config.backoff_max_delay,
                     )
                     await self.db.set_condition(
                         resource_id,
@@ -436,6 +438,8 @@ class Controller:
                     resource_id,
                     ResourceStatus.FAILED,
                     message=error_msg,
+                    backoff_base_delay=self.config.backoff_base_delay,
+                    backoff_max_delay=self.config.backoff_max_delay,
                 )
                 await self.db.set_condition(
                     resource_id,

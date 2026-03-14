@@ -569,6 +569,164 @@ class TestDatabaseManagerAsync:
             observed_generation=1,
         )
 
+    async def test_update_resource_status_failed_sets_backoff(
+        self, db_manager, mock_pool
+    ):
+        """FAILED status update sets next_reconcile_time via backoff formula."""
+        db_manager.pool = mock_pool
+        captured = {}
+
+        @asynccontextmanager
+        async def mock_acquire():
+            conn = AsyncMock()
+
+            async def capture_execute(query, *args):
+                captured["query"] = query
+                captured["args"] = args
+
+            conn.execute = capture_execute
+            yield conn
+
+        mock_pool.acquire = mock_acquire
+
+        await db_manager.update_resource_status(
+            resource_id=42,
+            status=ResourceStatus.FAILED,
+            message="Something went wrong",
+            backoff_base_delay=60,
+            backoff_max_delay=3600,
+        )
+
+        query = captured["query"]
+        args = captured["args"]
+
+        assert "next_reconcile_time" in query
+        assert "retry_count = retry_count + 1" in query
+        # base_delay and max_delay are passed as SQL params
+        assert 60 in args
+        assert 3600 in args
+        # resource_id is the last param
+        assert args[-1] == 42
+
+    async def test_update_resource_status_failed_query_has_valid_where(
+        self, db_manager, mock_pool
+    ):
+        """FAILED status update query does not have a comma before WHERE."""
+        db_manager.pool = mock_pool
+        captured = {}
+
+        @asynccontextmanager
+        async def mock_acquire():
+            conn = AsyncMock()
+
+            async def capture_execute(query, *args):
+                captured["query"] = query
+
+            conn.execute = capture_execute
+            yield conn
+
+        mock_pool.acquire = mock_acquire
+
+        await db_manager.update_resource_status(
+            resource_id=1,
+            status=ResourceStatus.FAILED,
+            message="err",
+        )
+
+        # Ensure no comma immediately before WHERE (which would be invalid SQL)
+        assert ", WHERE" not in captured["query"]
+        assert "WHERE id =" in captured["query"]
+
+    async def test_update_resource_status_ready_query_has_valid_where(
+        self, db_manager, mock_pool
+    ):
+        """READY status update query does not have a comma before WHERE."""
+        db_manager.pool = mock_pool
+        captured = {}
+
+        @asynccontextmanager
+        async def mock_acquire():
+            conn = AsyncMock()
+
+            async def capture_execute(query, *args):
+                captured["query"] = query
+
+            conn.execute = capture_execute
+            yield conn
+
+        mock_pool.acquire = mock_acquire
+
+        await db_manager.update_resource_status(
+            resource_id=1,
+            status=ResourceStatus.READY,
+            message="ok",
+            observed_generation=1,
+        )
+
+        assert ", WHERE" not in captured["query"]
+        assert "WHERE id =" in captured["query"]
+
+    async def test_update_resource_status_reconciling_query_has_valid_where(
+        self, db_manager, mock_pool
+    ):
+        """RECONCILING status update query does not have a comma before WHERE."""
+        db_manager.pool = mock_pool
+        captured = {}
+
+        @asynccontextmanager
+        async def mock_acquire():
+            conn = AsyncMock()
+
+            async def capture_execute(query, *args):
+                captured["query"] = query
+
+            conn.execute = capture_execute
+            yield conn
+
+        mock_pool.acquire = mock_acquire
+
+        await db_manager.update_resource_status(
+            resource_id=1,
+            status=ResourceStatus.RECONCILING,
+            message="starting",
+        )
+
+        assert ", WHERE" not in captured["query"]
+        assert "WHERE id =" in captured["query"]
+
+    async def test_requeue_failed_resources(self, db_manager, mock_pool):
+        """requeue_failed_resources updates next_reconcile_time for overdue failures."""
+        db_manager.pool = mock_pool
+        captured = {}
+
+        @asynccontextmanager
+        async def mock_acquire():
+            conn = AsyncMock()
+
+            async def capture_execute(query, *args):
+                captured["query"] = query
+                captured["args"] = args
+
+            conn.execute = capture_execute
+            yield conn
+
+        mock_pool.acquire = mock_acquire
+
+        await db_manager.requeue_failed_resources(
+            base_delay=60, max_delay=3600, jitter_factor=0.1
+        )
+
+        query = captured["query"]
+        args = captured["args"]
+
+        assert "next_reconcile_time" in query
+        assert "status = 'failed'" in query
+        # Formula should use retry_count - 1 for correct 1-min first retry
+        assert "retry_count - 1" in query
+        assert args[0] == 60
+        assert args[1] == 3600
+        assert args[2] == 0.1
+
     async def test_mark_resource_for_reconciliation(self, db_manager, mock_pool):
         """Test marking resource for reconciliation."""
         db_manager.pool = mock_pool

@@ -469,6 +469,51 @@ class TestControllerAsync:
         record_call = mock_db.record_reconciliation.call_args
         assert record_call[1]["success"] is False
 
+    async def test_reconcile_resource_failure_passes_backoff_params(
+        self, controller, mock_db, mock_registry
+    ):
+        """On failure, update_resource_status is called with backoff config params."""
+        mock_plugin = AsyncMock()
+        mock_plugin.prepare = AsyncMock(return_value="/workspace")
+        mock_plugin.plan = AsyncMock(
+            return_value=ActionResult(
+                success=False,
+                phase=ActionPhase.FAILED,
+                error_message="Plan failed",
+            )
+        )
+        mock_plugin.cleanup = AsyncMock()
+        mock_registry.get_action_plugin.return_value = mock_plugin
+
+        controller.config.backoff_base_delay = 60
+        controller.config.backoff_max_delay = 3600
+
+        resource = {
+            "id": 1,
+            "name": "test-resource",
+            "action_plugin": "github_actions",
+            "generation": 1,
+            "observed_generation": 0,
+            "spec": {},
+            "spec_hash": "abc123",
+            "plugin_config": {},
+            "status": "pending",
+            "last_reconcile_time": None,
+        }
+
+        await controller._reconcile_resource(resource)
+
+        # Find the FAILED status update call and verify backoff params were passed
+        failed_calls = [
+            call
+            for call in mock_db.update_resource_status.call_args_list
+            if call.args[1] == ResourceStatus.FAILED
+        ]
+        assert len(failed_calls) == 1
+        call_kwargs = failed_calls[0].kwargs
+        assert call_kwargs["backoff_base_delay"] == 60
+        assert call_kwargs["backoff_max_delay"] == 3600
+
     async def test_reconcile_resource_delete_success(
         self, controller, mock_db, mock_registry
     ):

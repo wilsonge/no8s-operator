@@ -30,6 +30,9 @@ to promote (e.g. https://aws.amazon.com/blogs/opensource/disaster-recovery-when-
 - **Admission webhooks** — validating and mutating webhooks before resource persistence
 - **Event streaming** — Server-Sent Events for real-time watch semantics (`kubectl get --watch` equivalent)
 - **Audit history** — complete log of all reconciliation attempts
+- **Automatic Reconciliation**: Continuous drift detection and correction
+- **Exponential Backoff**: Failed reconciliations retry with intelligent backoff
+- **Concurrent Reconciliation**: Multiple resources reconciled in parallel
 
 ## Quick start
 

@@ -653,40 +653,66 @@ class DatabaseManager:
         status: ResourceStatus,
         message: Optional[str] = None,
         observed_generation: Optional[int] = None,
+        backoff_base_delay: int = 60,
+        backoff_max_delay: int = 3600,
     ):
-        """Update the status of a resource."""
+        """
+        Update the status of a resource.
+
+        Args:
+            resource_id: The resource ID.
+            status: The new status.
+            message: Optional status message.
+            observed_generation: If provided, update observed_generation.
+            backoff_base_delay: Base delay in seconds for exponential backoff (FAILED only).
+            backoff_max_delay: Maximum delay in seconds for exponential backoff (FAILED only).
+        """
         async with self.pool.acquire() as conn:
-            query_parts = [
-                "UPDATE resources SET status = $1, status_message = $2, updated_at = NOW()"
+            set_parts = [
+                "status = $1",
+                "status_message = $2",
+                "updated_at = NOW()",
             ]
-            params = [status.value, message]
+            params: List[Any] = [status.value, message]
             param_count = 2
 
             if observed_generation is not None:
                 param_count += 1
-                query_parts.append(f"observed_generation = ${param_count}")
+                set_parts.append(f"observed_generation = ${param_count}")
                 params.append(observed_generation)
 
-            # Set next reconcile time based on status
             if status == ResourceStatus.READY:
-                # Reconcile again in 5 minutes for drift detection
-                query_parts.append(
-                    "next_reconcile_time = NOW() + INTERVAL '5 minutes', "
-                    "last_reconcile_time = NOW(), "
-                    "retry_count = 0"
+                # Reconcile again in 5 minutes for drift detection; reset retry counter
+                set_parts.extend(
+                    [
+                        "next_reconcile_time = NOW() + INTERVAL '5 minutes'",
+                        "last_reconcile_time = NOW()",
+                        "retry_count = 0",
+                    ]
                 )
             elif status == ResourceStatus.FAILED:
-                # Will be handled by requeue logic with exponential backoff
-                query_parts.append("retry_count = retry_count + 1")
+                # Schedule retry with exponential backoff using the current retry_count
+                # (before incrementing), so retry 1 = base_delay, retry 2 = 2*base_delay, etc.
+                param_count += 1
+                base_param = param_count
+                param_count += 1
+                max_param = param_count
+                params.append(backoff_base_delay)
+                params.append(backoff_max_delay)
+                set_parts.append(
+                    f"next_reconcile_time = NOW() + INTERVAL '1 second' * "
+                    f"LEAST(${base_param} * POWER(2, LEAST(retry_count, 10)), ${max_param})"
+                    f" * (1 + (random() * 2 - 1) * 0.1)"
+                )
+                set_parts.append("retry_count = retry_count + 1")
 
             param_count += 1
-            query_parts.append(f"WHERE id = ${param_count}")
             params.append(resource_id)
 
-            query = (
-                ", ".join(query_parts[1:]) if len(query_parts) > 2 else query_parts[1]
+            full_query = (
+                f"UPDATE resources SET {', '.join(set_parts)} "
+                f"WHERE id = ${param_count}"
             )
-            full_query = f"{query_parts[0]}, {query}"
 
             await conn.execute(full_query, *params)
 
@@ -827,7 +853,7 @@ class DatabaseManager:
                 UPDATE resources
                 SET next_reconcile_time = NOW() + (
                     INTERVAL '1 second' * LEAST(
-                        $1 * POWER(2, LEAST(retry_count, 10)),
+                        $1 * POWER(2, LEAST(retry_count - 1, 10)),
                         $2
                     ) * (1 + (random() * 2 - 1) * $3)
                 )

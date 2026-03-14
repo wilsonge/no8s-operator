@@ -58,22 +58,6 @@ The system follows a delegated controller pattern inspired by Kubernetes:
 6. **Reconciler Plugins** - 3rd party pip packages discovered via entry points, owning reconciliation logic per resource type.
 7. **Action Plugins** - Optional executors for reconcilers. Currently: **GitHub Actions (`plugins/actions/github_actions/`)**.
 
-## Key Features
-
-- **Declarative Infrastructure**: Define desired state; reconciler plugins ensure it matches reality
-- **Resource Types with Schema Validation**: OpenAPI v3 schemas (similar to Kubernetes CRDs)
-- **3rd Party Reconcilers**: Auto-discovered via Python entry points
-- **Authentication and RBAC**: JWT bearer tokens, bcrypt passwords, LDAP integration, custom roles with per-resource-type CRUD permissions
-- **Finalizers**: Kubernetes-style deletion protection — resources cannot be hard-deleted until all finalizers are cleared
-- **Status Conditions**: Named conditions (`Ready`, `Reconciling`, `Degraded`) set automatically by the controller; reconciler plugins add domain-specific conditions via `ctx.set_condition()`
-- **Admission Webhooks**: HTTP callback-based validating and mutating webhooks before persistence
-- **Event Streaming**: Server-Sent Events (SSE) for real-time watch semantics
-- **PostgreSQL Metadata**: Resource definitions, state, history, and locks (equivalent of etcd)
-- **Automatic Reconciliation**: Continuous drift detection and correction
-- **Exponential Backoff**: Failed reconciliations retry with intelligent backoff
-- **Concurrent Reconciliation**: Multiple resources reconciled in parallel
-- **Audit History**: Complete history of all reconciliation attempts
-
 ## Plugin Architecture
 
 Three plugin types: **input plugins** (event sources), **reconciler plugins** (reconciliation per resource type), and **action plugins** (optional executors).
@@ -142,30 +126,6 @@ ready/failed → deleting → (destroy) → remove finalizer → hard delete (if
 - **Failed**: Will retry with backoff
 - **Deleting**: Awaiting destroy and finalizer removal
 
-## Configuration
-
-### Database Schema
-
-PostgreSQL tables:
-
-- **resource_types**: Resource schemas with OpenAPI v3 validation
-- **resources**: Desired state, status, outputs, finalizers (`JSONB []`, must be empty for hard-delete), conditions (`JSONB []`)
-- **admission_webhooks**: Webhook endpoints for validating/mutating before persistence
-- **reconciliation_history**: Audit log of reconciliation attempts
-- **locks**: Distributed locking (for future multi-controller support)
-- **users**: Manual and LDAP-synced users with bcrypt passwords, `is_admin` flag, and status
-- **custom_roles**: Named permission sets assignable to users; includes `system_permissions` JSONB for system-level access flags
-- **custom_role_permissions**: Per-role permissions scoped by resource type, version, and CRUD operations
-
-### Controller Settings
-
-```python
-controller = OperatorController(
-    reconcile_interval=60,           # Check every 60 seconds
-    max_concurrent_reconciles=5      # Max 5 parallel reconciliations
-)
-```
-
 ## Advanced Features
 
 ### Finalizers
@@ -179,19 +139,6 @@ Kubernetes-style deletion protection. A resource cannot be hard-deleted until it
 4. Reconciler destroys external resources, then removes its finalizer
 5. Hard-deleted when no finalizers remain; stays in `deleting` if external finalizers exist
 
-The `hard_delete_resource()` DB method includes a guard: `WHERE finalizers = '[]'::jsonb`.
-
-### Admission Webhooks
-
-HTTP callback webhooks that intercept resource mutations before persistence (`src/admission.py`).
-
-- **Mutating**: Modifies the spec via JSON Patch. Called first, in `ordering` order.
-- **Validating**: Accepts or rejects. Called after mutating webhooks. Chain stops on first denial.
-
-`AdmissionChain.run()` fetches matching webhooks from DB, runs mutating (accumulating patches), then validating (stopping on denial). Raises `AdmissionError` on denial. Called in HTTP API handlers after schema validation, before persistence. Denial returns HTTP 403.
-
-See [`docs/admission-controllers.md`](docs/admission-controllers.md) for webhook configuration and the request/response format.
-
 ### Event Streaming
 
 Real-time watch semantics via SSE (`src/events.py`). `EventBus` provides in-memory pub/sub using `asyncio.Queue` per subscriber. Non-blocking publish drops events on full queues to prevent backpressure.
@@ -199,63 +146,6 @@ Real-time watch semantics via SSE (`src/events.py`). `EventBus` provides in-memo
 Event types: `CREATED`, `MODIFIED`, `DELETED` (emitted by HTTP API handlers), `RECONCILED` (emitted by controller).
 
 Endpoints: `GET /api/v1/events` (optional `resource_type` filter) and `GET /api/v1/resources/{id}/events`.
-
-### Status Conditions
-
-Kubernetes-style named conditions stored as a `conditions` JSONB array. `DatabaseManager.set_condition()` upserts by `type`, preserving `lastTransitionTime` if `status` is unchanged. Conditions appear in all resource GET responses via `_parse_resource_row()`.
-
-**Standard conditions set by `controller.py`:**
-
-| Event    | `Ready`                        | `Reconciling`                 | `Degraded `                |
-|----------|--------------------------------|-------------------------------|----------------------------|
-| Start    | `Unknown` / `ReconcileStarted` | `True` / `ReconcileStarted`   | —                          |
-| Success  | `True` / `ReconcileSuccess`    | `False` / `ReconcileComplete` | `False` / `NoErrors`       |
-| Failure  | `False` / `ReconcileFailed`    | `False` / `ReconcileFailed`   | `True` / `ReconcileFailed` |
-| Deleting | `Unknown` / `Deleting`         | `False` / `Deleting`          | —                          |
-
-Reconciler plugins add domain-specific conditions via `ctx.set_condition()`.
-
-### Authentication and RBAC
-
-All API endpoints except `POST /api/v1/auth/login` and `GET /health` require a JWT bearer token.
-
-**Permission model:**
-
-- **`is_admin` flag** — carried in the JWT. Admins bypass all permission checks.
-- **Custom role (resource permissions)** — resource-type-scoped CRUD permissions assigned via `custom_role_id`. Wildcard `*` matches any type/version.
-- **Custom role (system permissions)** — `system_permissions` JSONB array. Valid values: `"view_webhooks"`, `"view_plugins"`.
-
-**Key files:**
-- `src/auth.py` — `AuthManager` (JWT + bcrypt), FastAPI dependency functions, module-level singleton
-- `src/ldap_sync.py` — `LDAPSyncManager`: binds to LDAP, searches for users, upserts into local users table
-
-**Dependency functions used on routes:**
-
-| Dependency                                                      | Used on                                                                     |
-|-----------------------------------------------------------------|-----------------------------------------------------------------------------|
-| `require_admin`                                                 | User CRUD, custom role CRUD, resource type writes, admission webhook writes |
-| `get_current_user`                                              | Resource type reads (any authenticated user)                                |
-| `get_current_user` + `check_system_permission("view_webhooks")` | Admission webhook reads                                                     |
-| `get_current_user` + `check_system_permission("view_plugins")`  | Plugin discovery                                                            |
-| `get_current_user` + `check_resource_permission`                | All resource endpoints (scoped by resource type)                            |
-| `get_current_user` (with role-filtered stream)                  | Global event stream                                                         |
-
-See [`docs/users.md`](docs/users.md) for the full user management and RBAC reference.
-
-### Drift Detection
-
-Re-reconciliation every 5 minutes for `ready` resources. The reconciler determines if drift occurred and reconciles automatically.
-
-### Exponential Backoff (TODO)
-
-Failed reconciliations retry: 1min, 2min, 4min, ... up to ~17 hours.
-
-### Generation Tracking
-
-- **generation**: Increments on spec change
-- **observed_generation**: Last successfully reconciled generation
-
-Reconciliation triggers when `generation > observed_generation`.
 
 ## Development
 
