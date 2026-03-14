@@ -428,7 +428,15 @@ class TestEntryPointDiscovery:
         mock_ep = MagicMock()
         mock_ep.name = "dummy"
         mock_ep.load.return_value = DummyReconciler
-        mock_entry_points.return_value = [mock_ep]
+
+        # Return the reconciler entry point only for the reconcilers group;
+        # other groups (e.g. no8s.secret_stores) return an empty list.
+        def ep_side_effect(group):
+            if group == "no8s.reconcilers":
+                return [mock_ep]
+            return []
+
+        mock_entry_points.side_effect = ep_side_effect
 
         from plugins.registry import register_builtin_plugins, get_registry
 
@@ -457,7 +465,7 @@ class TestEntryPointDiscovery:
                 register_builtin_plugins()
 
         registry = get_registry()
-        mock_entry_points.assert_called_once_with(group="no8s.reconcilers")
+        mock_entry_points.assert_any_call(group="no8s.reconcilers")
         assert registry.has_reconciler_for_resource_type("DummyResource")
 
     @patch("plugins.registry.entry_points")

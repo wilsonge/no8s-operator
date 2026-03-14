@@ -45,9 +45,14 @@ class Application:
         """Initialize all components."""
         logger.info("Initializing Operator Controller")
 
-        # Register built-in plugins
+        # Register built-in plugins (including secret store backends)
         register_builtin_plugins()
         registry = get_registry()
+
+        # Initialize the configured secret store before anything else so that
+        # other components can retrieve secrets at startup.
+        await registry.get_secret_store(self.config.secret_store.plugin)
+        logger.info("Secret store initialized: %s", self.config.secret_store.plugin)
 
         # Initialize database
         db_config = self.config.database

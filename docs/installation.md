@@ -24,10 +24,14 @@ cd no8s-operator
 pip install .
 ```
 
-To include LDAP support:
+To include optional extras:
 
 ```bash
+# LDAP user sync
 pip install "no8s-operator[ldap]"
+
+# AWS Secrets Manager secret store backend
+pip install "no8s-operator[aws]"
 ```
 
 ## Install reconciler plugins
@@ -70,6 +74,24 @@ export INITIAL_ADMIN_PASSWORD=changeme123
 export GITHUB_TOKEN=ghp_your_token_here
 ```
 
+### Secret store (optional)
+
+By default secrets are read from environment variables. To use HashiCorp Vault
+or AWS Secrets Manager instead:
+
+```bash
+# HashiCorp Vault (no extra packages)
+export SECRET_STORE_PLUGIN=vault
+export VAULT_ADDR=https://vault.example.com:8200
+export VAULT_TOKEN=s.xxxxxxxxxxxx
+
+# AWS Secrets Manager (requires pip install "no8s-operator[aws]")
+export SECRET_STORE_PLUGIN=aws_secrets_manager
+export AWS_REGION=eu-west-1
+```
+
+See [`docs/secret-stores.md`](secret-stores.md) for full configuration options and how to write a custom backend.
+
 ### LDAP (optional)
 
 ```bash
@@ -102,9 +124,10 @@ On startup the operator:
 
 1. Connects to PostgreSQL and initialises the schema.
 2. Bootstraps the initial admin user (if `INITIAL_ADMIN_USERNAME` is set and the users table is empty).
-3. Scans the `no8s.reconcilers` entry point group and registers each discovered reconciler.
-4. Starts the controller loop and each reconciler's own reconciliation loop.
-5. Starts the HTTP API on port `8000`.
+3. Initialises the configured secret store (`SECRET_STORE_PLUGIN`, default `env`).
+4. Scans the `no8s.reconcilers` entry point group and registers each discovered reconciler.
+5. Starts the controller loop and each reconciler's own reconciliation loop.
+6. Starts the HTTP API on port `8000`.
 
 You should see log lines like:
 
@@ -162,3 +185,4 @@ Non-admin users need the `view_plugins` system permission on their custom role t
 - **Create resources** — use `POST /api/v1/resources` to declare desired state. The appropriate reconciler picks it up and drives it to `ready`. See [`docs/resources.md`](resources.md).
 - **Write your own reconciler** — see [`docs/writing-a-reconciler.md`](writing-a-reconciler.md) for a full walkthrough.
 - **Manage users and RBAC** — see [`docs/users.md`](users.md) for authentication, custom roles, and LDAP.
+- **Secret stores** — see [`docs/secret-stores.md`](secret-stores.md) to configure Vault, AWS Secrets Manager, or a custom backend.

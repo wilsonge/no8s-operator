@@ -24,6 +24,9 @@ dependencies = [
 ldap = [
     "ldap3>=2.9",
 ]
+aws = [
+    "boto3>=1.34",
+]
 dev = [
     "flake8>=7.3.0",
     "black>=26.1.0",
@@ -33,6 +36,10 @@ dev = [
     "httpx>=0.27.0",
     "pglast>=7.0",
 ]
+
+[project.entry-points."no8s.secret_stores"]
+# Third-party packages register their secret store plugins here.
+# Example: my_vault_plugin = "mypkg.stores:CustomVaultStore"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

@@ -199,6 +199,19 @@ class LDAPConfig:
 
 
 @dataclass
+class SecretStoreConfig:
+    """Secret store plugin configuration."""
+
+    # Name of the secret store plugin to use (e.g. 'env', 'vault', 'aws_secrets_manager')
+    plugin: str = "env"
+
+    @classmethod
+    def from_env(cls) -> "SecretStoreConfig":
+        """Load from environment variables."""
+        return cls(plugin=os.getenv("SECRET_STORE_PLUGIN", "env"))
+
+
+@dataclass
 class LeaderElectionConfig:
     """Distributed leader election configuration."""
 
@@ -237,6 +250,7 @@ class Config:
     auth: AuthConfig = field(default_factory=AuthConfig)
     ldap: LDAPConfig = field(default_factory=LDAPConfig)
     leader_election: LeaderElectionConfig = field(default_factory=LeaderElectionConfig)
+    secret_store: SecretStoreConfig = field(default_factory=SecretStoreConfig)
 
     @classmethod
     def from_env(cls):
@@ -249,6 +263,7 @@ class Config:
             auth=AuthConfig.from_env(),
             ldap=LDAPConfig.from_env(),
             leader_election=LeaderElectionConfig.from_env(),
+            secret_store=SecretStoreConfig.from_env(),
         )
 
     @classmethod
@@ -262,6 +277,7 @@ class Config:
             auth=AuthConfig(),
             ldap=LDAPConfig(),
             leader_election=LeaderElectionConfig(),
+            secret_store=SecretStoreConfig(),
         )
 
 

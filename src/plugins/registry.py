@@ -11,6 +11,7 @@ from typing import Any, Dict, Optional, Type
 from plugins.base import logger
 from plugins.actions.base import ActionPlugin
 from plugins.inputs.base import InputPlugin
+from plugins.secrets.base import SecretStorePlugin
 
 
 class PluginRegistry:
@@ -18,7 +19,7 @@ class PluginRegistry:
     Central registry for all plugins.
 
     Handles discovery, registration, and instantiation of action, input,
-    and reconciler plugins.
+    reconciler, and secret store plugins.
     """
 
     def __init__(self):
@@ -26,6 +27,7 @@ class PluginRegistry:
         self._action_plugins: Dict[str, Type[ActionPlugin]] = {}
         self._input_plugins: Dict[str, Type[InputPlugin]] = {}
         self._reconciler_plugins: Dict[str, Type] = {}
+        self._secret_store_plugins: Dict[str, Type[SecretStorePlugin]] = {}
 
         # Cached plugin metadata (name, version) to avoid repeated instantiation
         self._action_plugin_info: Dict[str, Dict[str, str]] = {}
@@ -36,6 +38,8 @@ class PluginRegistry:
         self._action_instances: Dict[str, ActionPlugin] = {}
         self._input_instances: Dict[str, InputPlugin] = {}
         self._reconciler_instances: Dict[str, Any] = {}
+        self._secret_store_instance: Optional[SecretStorePlugin] = None
+        self._active_secret_store_name: str = "env"
 
         # Plugin configurations loaded from environment
         self._action_plugin_configs: Dict[str, Dict[str, Any]] = {}
@@ -45,6 +49,67 @@ class PluginRegistry:
         self._resource_type_to_reconciler: Dict[str, str] = {}
 
     # Registration methods
+
+    def register_secret_store_plugin(
+        self, plugin_class: Type[SecretStorePlugin]
+    ) -> None:
+        """
+        Register a secret store plugin class.
+
+        Args:
+            plugin_class: The SecretStorePlugin subclass to register.
+        """
+        temp_instance = plugin_class()
+        name = temp_instance.name
+
+        if name in self._secret_store_plugins:
+            logger.warning(f"Overwriting existing secret store plugin: {name}")
+
+        self._secret_store_plugins[name] = plugin_class
+        logger.info(f"Registered secret store plugin: {name} v{temp_instance.version}")
+
+    async def get_secret_store(self, name: Optional[str] = None) -> SecretStorePlugin:
+        """
+        Return the active (initialized) secret store instance.
+
+        If *name* is provided it overrides the current active store name
+        before initialization.  Subsequent calls without *name* return the
+        same cached instance.
+
+        Args:
+            name: Optional plugin name to activate.
+
+        Returns:
+            An initialized SecretStorePlugin instance.
+
+        Raises:
+            ValueError: If the requested plugin name is not registered.
+        """
+        if name is not None:
+            self._active_secret_store_name = name
+
+        if self._secret_store_instance is not None:
+            return self._secret_store_instance
+
+        store_name = self._active_secret_store_name
+        if store_name not in self._secret_store_plugins:
+            available = ", ".join(self._secret_store_plugins.keys()) or "none"
+            raise ValueError(
+                f"Unknown secret store plugin: '{store_name}'. "
+                f"Available plugins: {available}"
+            )
+
+        plugin_class = self._secret_store_plugins[store_name]
+        instance = plugin_class()
+        config = plugin_class.load_config_from_env()
+        await instance.initialize(config)
+        self._secret_store_instance = instance
+        logger.info(f"Initialized secret store plugin: {store_name}")
+        return instance
+
+    def list_secret_store_plugins(self) -> list[str]:
+        """List all registered secret store plugin names."""
+        return list(self._secret_store_plugins.keys())
 
     def register_action_plugin(self, plugin_class: Type[ActionPlugin]) -> None:
         """
@@ -340,16 +405,60 @@ def reset_registry() -> None:
     _registry = None
 
 
+async def get_secret_store() -> SecretStorePlugin:
+    """
+    Convenience wrapper — return the active secret store from the global registry.
+
+    Plugins and reconcilers can call this instead of going through the registry
+    directly::
+
+        from plugins.registry import get_secret_store
+
+        token = await (await get_secret_store()).get_secret("GITHUB_TOKEN")
+    """
+    return await get_registry().get_secret_store()
+
+
 def register_builtin_plugins() -> None:
     """
-    Register all built-in plugins and discover reconciler plugins
+    Register all built-in plugins and discover external plugins
     via entry points.
 
     This function is called during application startup to register
     the default plugins that ship with the controller and to discover
-    any installed reconciler plugins.
+    any installed reconciler or secret store plugins.
     """
     registry = get_registry()
+
+    # Import and register built-in secret store plugins
+    try:
+        from plugins.secrets.env import EnvSecretStore
+
+        registry.register_secret_store_plugin(EnvSecretStore)
+    except ImportError as e:
+        logger.warning(f"Could not load env secret store plugin: {e}")
+
+    try:
+        from plugins.secrets.vault import VaultSecretStore
+
+        registry.register_secret_store_plugin(VaultSecretStore)
+    except ImportError:
+        pass  # hvac not installed — Vault backend unavailable
+
+    try:
+        from plugins.secrets.aws_secrets_manager import AWSSecretsManagerStore
+
+        registry.register_secret_store_plugin(AWSSecretsManagerStore)
+    except ImportError:
+        pass  # boto3 not installed — AWS Secrets Manager backend unavailable
+
+    # Discover and register third-party secret store plugins via entry points
+    for ep in entry_points(group="no8s.secret_stores"):
+        try:
+            store_class = ep.load()
+            registry.register_secret_store_plugin(store_class)
+        except Exception as e:
+            logger.warning(f"Could not load secret store plugin {ep.name}: {e}")
 
     # Import and register built-in action plugins
     try:
