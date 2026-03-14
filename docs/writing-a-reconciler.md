@@ -592,10 +592,10 @@ Outputs appear in every `GET /api/v1/resources/{id}` response under the `outputs
 
 Every resource carries two JSON fields. Understanding the difference is important when designing your resource schema:
 
-| Field | Purpose | Who owns it |
-|---|---|---|
-| `spec` | **Desired end-state** of the managed resource (e.g. `engine`, `version`, `storage_gb`). This is the source of truth your reconciler works toward. | The resource owner (user or automation) |
-| `plugin_config` | **Action plugin configuration** — backend-specific settings such as a GitHub repository name, workflow ID, AWS region, or Terraform backend URL. Reconcilers that call provider APIs directly rather than via an action plugin will typically leave this empty. | The operator administrator |
+| Field           | Purpose                                                                                                                                                                                                                                                         | Who owns it                             |
+|-----------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-----------------------------------------|
+| `spec`          | **Desired end-state** of the managed resource (e.g. `engine`, `version`, `storage_gb`). This is the source of truth your reconciler works toward.                                                                                                               | The resource owner (user or automation) |
+| `plugin_config` | **Action plugin configuration** — backend-specific settings such as a GitHub repository name, workflow ID, AWS region, or Terraform backend URL. Reconcilers that call provider APIs directly rather than via an action plugin will typically leave this empty. | The operator administrator              |
 
 A database reconciler that calls the cloud provider API directly only uses `spec`:
 
