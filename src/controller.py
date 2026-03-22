@@ -338,8 +338,12 @@ class Controller:
                 # Update final status
                 if result.success:
                     if resource.get("status") == ResourceStatus.DELETING.value:
-                        # Destroy succeeded — remove our finalizer and
-                        # hard-delete if all finalizers are cleared
+                        # Finalizer-based deletion:
+                        # 1. API soft-deletes: sets status=deleting, deleted_at timestamp
+                        # 2. Reconciler destroys external resources (this block)
+                        # 3. Reconciler removes its own finalizer
+                        # 4. Hard-delete fires only when all finalizers are cleared;
+                        #    stays in 'deleting' if external finalizers remain
                         await self.db.set_condition(
                             resource_id,
                             "Reconciling",

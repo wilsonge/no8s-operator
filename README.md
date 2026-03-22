@@ -102,6 +102,9 @@ See [docs/installation.md](docs/installation.md) for manual installation, enviro
 - [ ] Runtime reconciler hot-reload
 - [ ] Add ability to require metadata keys on resource types (similar to AWS SCP's)
 - [ ] Add roles that can only see resources with certain metadata (similar to AWS ABAC)
+- [ ] Review of which resources belong in the plugin which can be disabled and which should be constantly enabled (similar to the cluster_status.py file)
+- [ ] **HTTP Polling** (planned) - Poll external APIs for state changes
+- [ ] **Queue Listeners** (planned) - SQS, RabbitMQ, etc.
 
 ## License
 
