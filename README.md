@@ -13,13 +13,9 @@ no8s-operator brings declarative infrastructure management to any environment �
 structured status tracking, and audit history — backed by PostgreSQL and a lightweight plugin architecture. Define the
 desired state of your resources; reconciler plugins do the rest.
 
-**Built for real-world operational needs:**
-
-- **Multicloud and multi-region by design** — because state lives in PostgreSQL, you can run operator instances across
-  clouds and regions against a shared or replicated store. Manage AWS, GCP, and Azure resources from a single control
-  plane, or deploy region-local instances that share state seamlessly.
-- **True active/passive DR** — failover is a DNS swap. Promote a standby instance in seconds with no cluster snapshot
-  restore, no etcd archaeology, and no cloud-specific recovery runbook.
+- **Multicloud and multi-region by design** — manage AWS, GCP, Azure, and on-premise resources from a single control
+  plane. Run operator instances across clouds against a shared or replicated PostgreSQL store, with failover as simple
+  as a DNS swap — no cluster snapshots, no etcd archaeology, no cloud-specific recovery runbook.
 - **Fits your existing stack** — no container orchestrator required. Run it wherever you can run Python and PostgreSQL:
   VMs, bare metal, managed container services, or a single laptop.
 - **Extensible by design** — reconciler plugins are plain pip packages, auto-discovered via Python entry points. Teams
