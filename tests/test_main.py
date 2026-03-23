@@ -566,6 +566,87 @@ class TestApplicationStart:
 
         app.initialize.assert_not_called()
 
+    async def test_on_resource_event_publishes_trigger(self):
+        """on_resource_event publishes a TRIGGER event to the event bus."""
+        from events import EventBus, EventType
+
+        with patch("main.get_config"):
+            app = Application()
+
+        bus = EventBus()
+        app.event_bus = bus
+        app.controller = AsyncMock()
+        app.input_plugins = []
+        app.leader_election = AsyncMock()
+        app.initialize = AsyncMock()
+
+        _, sub = await bus.subscribe(
+            filter_fn=lambda e: e.event_type == EventType.TRIGGER
+        )
+
+        spec = MagicMock()
+        spec.name = "my-db"
+        spec.resource_type_name = "DatabaseCluster"
+
+        original_create_task = asyncio.create_task
+
+        def tracking_create_task(coro, **kwargs):
+            return original_create_task(coro, **kwargs)
+
+        async def fake_gather(*tasks):
+            # Execute the on_resource_event callback that was passed to start()
+            pass
+
+        with (
+            patch("main.asyncio.gather", new_callable=AsyncMock),
+            patch("main.asyncio.create_task", side_effect=tracking_create_task),
+        ):
+            # We need to intercept the on_resource_event closure
+            # Directly test by calling start and extracting via plugin.start
+            plugin = AsyncMock()
+            plugin.start = AsyncMock()
+            app.input_plugins = [plugin]
+            await app.start()
+
+        # Extract the callback passed to plugin.start
+        assert plugin.start.called
+        callback = plugin.start.call_args[0][0]
+
+        # Call the callback and check that a TRIGGER is published
+        await callback("CREATED", spec)
+
+        import asyncio as _asyncio
+
+        received = await _asyncio.wait_for(sub.__anext__(), timeout=1.0)
+        assert received.event_type == EventType.TRIGGER
+        assert received.resource_type_name == "DatabaseCluster"
+        assert received.resource_name == "my-db"
+
+    async def test_on_resource_event_no_bus_is_safe(self):
+        """on_resource_event does not raise when event_bus is None."""
+        with patch("main.get_config"):
+            app = Application()
+
+        app.event_bus = None
+        app.controller = AsyncMock()
+        app.input_plugins = []
+        app.leader_election = AsyncMock()
+        app.initialize = AsyncMock()
+
+        plugin = AsyncMock()
+        plugin.start = AsyncMock()
+        app.input_plugins = [plugin]
+
+        with patch("main.asyncio.gather", new_callable=AsyncMock):
+            await app.start()
+
+        callback = plugin.start.call_args[0][0]
+        spec = MagicMock()
+        spec.name = "r"
+        spec.resource_type_name = "T"
+        # Should not raise
+        await callback("MODIFIED", spec)
+
     async def test_start_creates_ldap_task_when_configured(self):
         with patch("main.get_config") as mock_cfg:
             mock_cfg.return_value = MagicMock()

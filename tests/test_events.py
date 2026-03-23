@@ -27,7 +27,10 @@ class TestEventType:
         assert EventType.RECONCILED.value == "RECONCILED"
 
     def test_all_members(self):
-        assert len(EventType) == 4
+        assert len(EventType) == 5
+
+    def test_trigger_value(self):
+        assert EventType.TRIGGER.value == "TRIGGER"
 
 
 # ==================== ResourceEvent tests ====================
@@ -331,3 +334,23 @@ class TestEventBus:
         sid, _ = await bus.subscribe()
         await bus.unsubscribe(sid)
         await bus.publish(sample_event)
+
+    async def test_trigger_event_published_and_consumed(self, bus):
+        """A TRIGGER event is published and received by a subscriber."""
+        _, sub = await bus.subscribe(
+            filter_fn=lambda e: e.event_type == EventType.TRIGGER
+        )
+        trigger = ResourceEvent(
+            event_type=EventType.TRIGGER,
+            resource_id=0,
+            resource_name="my-resource",
+            resource_type_name="DatabaseCluster",
+            resource_type_version="",
+            resource_data={},
+            timestamp="2024-01-15T10:30:00Z",
+        )
+        await bus.publish(trigger)
+        received = await asyncio.wait_for(sub.__anext__(), timeout=1.0)
+        assert received.event_type == EventType.TRIGGER
+        assert received.resource_type_name == "DatabaseCluster"
+        assert received.resource_id == 0

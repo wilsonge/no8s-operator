@@ -15,6 +15,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, TypedDict
 
 from db import DatabaseManager, ResourceStatus
+from events import EventBus
 from plugins.actions.base import ActionPlugin
 from plugins.registry import PluginRegistry
 
@@ -84,10 +85,12 @@ class ReconcilerContext:
         db: DatabaseManager,
         registry: PluginRegistry,
         shutdown_event: asyncio.Event,
+        event_bus: Optional[EventBus] = None,
     ):
         self.db = db
         self.registry = registry
         self.shutdown_event = shutdown_event
+        self.event_bus = event_bus
 
     async def get_resources_needing_reconciliation(
         self,
@@ -364,40 +367,78 @@ class BaseReconciler(ReconcilerPlugin):
     reconcile_interval: int = 30
 
     async def start(self, ctx: ReconcilerContext) -> None:
-        logger.info(f"{self.name} reconciler started")
-        while not ctx.shutdown_event.is_set():
-            try:
-                resources = await ctx.get_resources_needing_reconciliation(
-                    resource_type_names=self.resource_types,
-                )
-                for resource in resources:
-                    if ctx.shutdown_event.is_set():
-                        break
-                    start_time = time.monotonic()
-                    try:
-                        result = await self.reconcile(resource, ctx)
-                    except Exception as exc:
-                        logger.exception(
-                            f"{self.name}: unhandled error reconciling "
-                            f"resource {resource['id']}"
-                        )
-                        result = ReconcileResult(success=False, message=str(exc))
-                    await ctx.record_reconciliation(
-                        resource_id=resource["id"],
-                        result=result,
-                        duration_seconds=time.monotonic() - start_time,
-                    )
-            except Exception:
-                logger.exception(f"{self.name}: error in reconcile loop")
+        from events import EventType
 
-            try:
-                await asyncio.wait_for(
-                    ctx.shutdown_event.wait(),
-                    timeout=float(self.reconcile_interval),
+        sub_id, subscription = None, None
+        if ctx.event_bus:
+            sub_id, subscription = await ctx.event_bus.subscribe(
+                lambda e: e.event_type == EventType.TRIGGER
+                and e.resource_type_name in self.resource_types
+            )
+
+        logger.info(f"{self.name} reconciler started")
+        try:
+            while not ctx.shutdown_event.is_set():
+                try:
+                    resources = await ctx.get_resources_needing_reconciliation(
+                        resource_type_names=self.resource_types,
+                    )
+                    for resource in resources:
+                        if ctx.shutdown_event.is_set():
+                            break
+                        start_time = time.monotonic()
+                        try:
+                            result = await self.reconcile(resource, ctx)
+                        except Exception as exc:
+                            logger.exception(
+                                f"{self.name}: unhandled error reconciling "
+                                f"resource {resource['id']}"
+                            )
+                            result = ReconcileResult(success=False, message=str(exc))
+                        await ctx.record_reconciliation(
+                            resource_id=resource["id"],
+                            result=result,
+                            duration_seconds=time.monotonic() - start_time,
+                        )
+                except Exception:
+                    logger.exception(f"{self.name}: error in reconcile loop")
+
+                # Wait for shutdown, poll timeout, or immediate TRIGGER wake-up
+                shutdown_task = asyncio.ensure_future(ctx.shutdown_event.wait())
+                sleep_task = asyncio.ensure_future(
+                    asyncio.sleep(float(self.reconcile_interval))
                 )
-                break  # shutdown_event was set
-            except asyncio.TimeoutError:
-                continue
+                wait_tasks = [shutdown_task, sleep_task]
+
+                async def _next_trigger(sub):
+                    try:
+                        await sub.__anext__()
+                    except (StopAsyncIteration, asyncio.CancelledError):
+                        pass
+
+                trigger_task = (
+                    asyncio.ensure_future(_next_trigger(subscription))
+                    if subscription
+                    else None
+                )
+                if trigger_task:
+                    wait_tasks.append(trigger_task)
+
+                done, pending = await asyncio.wait(
+                    wait_tasks, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in pending:
+                    task.cancel()
+                    try:
+                        await task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+
+                if shutdown_task in done:
+                    break
+        finally:
+            if sub_id and ctx.event_bus:
+                await ctx.event_bus.unsubscribe(sub_id)
 
         logger.info(f"{self.name} reconciler stopped")
 

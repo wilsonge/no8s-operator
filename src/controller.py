@@ -144,6 +144,7 @@ class Controller:
             db=self.db,
             registry=self.registry,
             shutdown_event=self._shutdown_event,
+            event_bus=self._event_bus,
         )
 
         for reconciler_name in self.registry.list_reconciler_plugins():

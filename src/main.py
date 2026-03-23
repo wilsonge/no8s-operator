@@ -208,11 +208,23 @@ class Application:
         self.running = True
         logger.info("Starting Operator Controller")
 
-        # Resource event callback (for future use when input plugins notify controller)
+        # Resource event callback — publishes a TRIGGER to wake reconcilers immediately
         async def on_resource_event(event_type: str, spec):
             logger.debug(f"Resource event: {event_type} - {spec.name}")
-            # Controller already polls database, so no immediate action needed
-            # This callback can be used for more immediate reconciliation in the future
+            if self.event_bus:
+                from datetime import datetime
+                from events import EventType, ResourceEvent
+
+                event = ResourceEvent(
+                    event_type=EventType.TRIGGER,
+                    resource_id=0,
+                    resource_name=spec.name,
+                    resource_type_name=spec.resource_type_name,
+                    resource_type_version="",
+                    resource_data={},
+                    timestamp=datetime.utcnow().isoformat() + "Z",
+                )
+                await self.event_bus.publish(event)
 
         # Start leader election wrapping the controller (only leader reconciles)
         async def run_with_election():

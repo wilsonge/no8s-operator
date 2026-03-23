@@ -832,3 +832,83 @@ class TestControllerConditions:
         ]
         assert ("Reconciling", "False", "Deleting") in condition_calls
         assert ("Ready", "Unknown", "Deleting") in condition_calls
+
+
+# ==================== event_bus passed to ReconcilerContext ====================
+
+
+@pytest.mark.asyncio
+class TestStartReconcilersPassesEventBus:
+    """_start_reconcilers() must forward event_bus to ReconcilerContext."""
+
+    @pytest.fixture
+    def mock_db(self):
+        db = AsyncMock()
+        db.get_resources_needing_reconciliation = AsyncMock(return_value=[])
+        db.requeue_failed_resources = AsyncMock()
+        return db
+
+    @pytest.fixture
+    def mock_registry(self):
+        registry = MagicMock()
+        registry.list_reconciler_plugins.return_value = []
+        return registry
+
+    async def test_event_bus_forwarded_to_reconciler_context(
+        self, mock_db, mock_registry
+    ):
+        from events import EventBus
+
+        bus = EventBus()
+        config = ControllerConfig(reconcile_interval=1)
+        controller = Controller(
+            db_manager=mock_db,
+            registry=mock_registry,
+            config=config,
+            event_bus=bus,
+        )
+
+        captured_ctx = []
+
+        async def capture_start(ctx):
+            captured_ctx.append(ctx)
+
+        mock_reconciler = MagicMock()
+        mock_reconciler.name = "test"
+        mock_reconciler.start = capture_start
+        mock_registry.list_reconciler_plugins.return_value = ["test"]
+        mock_registry.get_reconciler_plugin.return_value = mock_reconciler
+
+        await controller._start_reconcilers()
+        # Allow task to run
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        assert len(captured_ctx) == 1
+        assert captured_ctx[0].event_bus is bus
+
+    async def test_no_event_bus_context_has_none(self, mock_db, mock_registry):
+        config = ControllerConfig(reconcile_interval=1)
+        controller = Controller(
+            db_manager=mock_db,
+            registry=mock_registry,
+            config=config,
+        )
+
+        captured_ctx = []
+
+        async def capture_start(ctx):
+            captured_ctx.append(ctx)
+
+        mock_reconciler = MagicMock()
+        mock_reconciler.name = "test"
+        mock_reconciler.start = capture_start
+        mock_registry.list_reconciler_plugins.return_value = ["test"]
+        mock_registry.get_reconciler_plugin.return_value = mock_reconciler
+
+        await controller._start_reconcilers()
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        assert len(captured_ctx) == 1
+        assert captured_ctx[0].event_bus is None

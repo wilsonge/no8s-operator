@@ -31,6 +31,7 @@ class EventType(Enum):
     MODIFIED = "MODIFIED"
     DELETED = "DELETED"
     RECONCILED = "RECONCILED"
+    TRIGGER = "TRIGGER"
 
 
 @dataclass

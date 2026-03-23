@@ -1036,3 +1036,171 @@ class TestDatabaseReconciliationByType:
         assert call_args[0][1] == "TypeA"
         assert call_args[0][2] == "TypeB"
         assert call_args[0][3] == 10
+
+
+# ==================== Event-driven Wake-up Tests ====================
+
+
+class TestReconcilerContextEventBus:
+    """Tests that ReconcilerContext stores and exposes event_bus."""
+
+    def test_event_bus_defaults_to_none(self):
+        ctx = ReconcilerContext(
+            db=AsyncMock(),
+            registry=MagicMock(),
+            shutdown_event=asyncio.Event(),
+        )
+        assert ctx.event_bus is None
+
+    def test_event_bus_stored_when_provided(self):
+        from events import EventBus
+
+        bus = EventBus()
+        ctx = ReconcilerContext(
+            db=AsyncMock(),
+            registry=MagicMock(),
+            shutdown_event=asyncio.Event(),
+            event_bus=bus,
+        )
+        assert ctx.event_bus is bus
+
+
+@pytest.mark.asyncio
+class TestBaseReconcilerTriggerWakeUp:
+    """Tests that BaseReconciler wakes immediately on a TRIGGER event."""
+
+    @pytest.fixture
+    def mock_db(self):
+        db = AsyncMock()
+        db.get_resources_needing_reconciliation_by_type = AsyncMock(return_value=[])
+        db.record_reconciliation = AsyncMock()
+        db.mark_resource_for_reconciliation = AsyncMock()
+        return db
+
+    @pytest.fixture
+    def mock_registry(self):
+        return MagicMock()
+
+    async def test_trigger_wakes_reconciler_before_interval(
+        self, mock_db, mock_registry
+    ):
+        """A TRIGGER event causes the reconciler to run again before the poll interval."""
+        from events import EventBus, EventType, ResourceEvent
+
+        bus = EventBus()
+        shutdown_event = asyncio.Event()
+
+        class CountingReconciler(BaseReconciler):
+            reconcile_interval = 9999  # very long — test must not actually wait
+
+            @property
+            def name(self):
+                return "counting"
+
+            @property
+            def resource_types(self):
+                return ["MyResource"]
+
+            async def reconcile(self, resource, ctx):
+                return ReconcileResult(success=True)
+
+        reconciler = CountingReconciler()
+
+        async def send_trigger_then_shutdown():
+            # Let the reconciler finish its first poll and reach the wait
+            while mock_db.get_resources_needing_reconciliation_by_type.call_count == 0:
+                await asyncio.sleep(0)
+            trigger = ResourceEvent(
+                event_type=EventType.TRIGGER,
+                resource_id=0,
+                resource_name="r",
+                resource_type_name="MyResource",
+                resource_type_version="",
+                resource_data={},
+                timestamp="2024-01-15T10:30:00Z",
+            )
+            await bus.publish(trigger)
+            # Give the reconciler a moment to wake and start the second loop
+            for _ in range(20):
+                await asyncio.sleep(0)
+            shutdown_event.set()
+
+        ctx = ReconcilerContext(
+            db=mock_db,
+            registry=mock_registry,
+            shutdown_event=shutdown_event,
+            event_bus=bus,
+        )
+
+        asyncio.create_task(send_trigger_then_shutdown())
+        await asyncio.wait_for(reconciler.start(ctx), timeout=5.0)
+
+        # The reconciler must have polled at least twice (initial + triggered)
+        assert mock_db.get_resources_needing_reconciliation_by_type.call_count >= 2
+
+    async def test_reconciler_without_event_bus_still_polls(
+        self, mock_db, mock_registry
+    ):
+        """When no event_bus is provided the reconciler falls back to polling."""
+        shutdown_event = asyncio.Event()
+
+        class FastReconciler(BaseReconciler):
+            reconcile_interval = 0
+
+            @property
+            def name(self):
+                return "fast"
+
+            @property
+            def resource_types(self):
+                return ["X"]
+
+            async def reconcile(self, resource, ctx):
+                return ReconcileResult(success=True)
+
+        ctx = ReconcilerContext(
+            db=mock_db,
+            registry=mock_registry,
+            shutdown_event=shutdown_event,
+        )
+
+        async def stop_after_first_poll():
+            # Wait for the first poll to happen then shut down
+            while mock_db.get_resources_needing_reconciliation_by_type.call_count == 0:
+                await asyncio.sleep(0)
+            shutdown_event.set()
+
+        asyncio.create_task(stop_after_first_poll())
+        await asyncio.wait_for(FastReconciler().start(ctx), timeout=5.0)
+        assert mock_db.get_resources_needing_reconciliation_by_type.call_count >= 1
+
+    async def test_reconciler_unsubscribes_on_shutdown(self, mock_db, mock_registry):
+        """After shutdown the reconciler unsubscribes from the event bus."""
+        from events import EventBus
+
+        bus = EventBus()
+        shutdown_event = asyncio.Event()
+
+        class MinimalReconciler(BaseReconciler):
+            reconcile_interval = 0
+
+            @property
+            def name(self):
+                return "minimal"
+
+            @property
+            def resource_types(self):
+                return ["Z"]
+
+            async def reconcile(self, resource, ctx):
+                return ReconcileResult(success=True)
+
+        ctx = ReconcilerContext(
+            db=mock_db,
+            registry=mock_registry,
+            shutdown_event=shutdown_event,
+            event_bus=bus,
+        )
+        shutdown_event.set()
+        await MinimalReconciler().start(ctx)
+        assert bus.subscriber_count() == 0
