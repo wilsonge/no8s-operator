@@ -9,15 +9,21 @@ this fully production ready! But be warned if you're looking at it during these 
 
 ## What it is
 
-In some environments, Kubernetes isn't an option — but you still want the operational benefits of declarative infrastructure
-management: drift detection, automatic reconciliation, structured status tracking, and audit history. no8s-operator
-provides that, using PostgreSQL as the backing store and a plugin architecture where 3rd party reconcilers handle
-domain-specific resource types.
+no8s-operator brings declarative infrastructure management to any environment — drift detection, automatic reconciliation,
+structured status tracking, and audit history — backed by PostgreSQL and a lightweight plugin architecture. Define the
+desired state of your resources; reconciler plugins do the rest.
 
-The primary reason here that we use PostgreSQL and drop kubernetes is to allow this to be provisioned as an active/passive
-setup that can be failed over at any given time (alongside a DNS swap), allowing users to run across regions or clouds in
-DR scenarios. In current kubernetes scenarios that would mean restoring cluster backups across cloud which can be slower
-to promote (e.g. https://aws.amazon.com/blogs/opensource/disaster-recovery-when-using-crossplane-for-infrastructure-provisioning-on-aws/),
+**Built for real-world operational needs:**
+
+- **Multicloud and multi-region by design** — because state lives in PostgreSQL, you can run operator instances across
+  clouds and regions against a shared or replicated store. Manage AWS, GCP, and Azure resources from a single control
+  plane, or deploy region-local instances that share state seamlessly.
+- **True active/passive DR** — failover is a DNS swap. Promote a standby instance in seconds with no cluster snapshot
+  restore, no etcd archaeology, and no cloud-specific recovery runbook.
+- **Fits your existing stack** — no container orchestrator required. Run it wherever you can run Python and PostgreSQL:
+  VMs, bare metal, managed container services, or a single laptop.
+- **Extensible by design** — reconciler plugins are plain pip packages, auto-discovered via Python entry points. Teams
+  ship domain-specific reconcilers independently without touching core operator code.
 
 ## Features
 
