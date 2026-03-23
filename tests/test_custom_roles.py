@@ -449,14 +449,21 @@ class TestCustomRoleEndpoints:
             "custom_role_id": None,
         }
 
-    async def _make_client(self, db_mock):
-        from plugins.inputs.http.api import HTTPInputPlugin
+    def _make_client(self, db_mock):
+        from fastapi import FastAPI
+        from unittest.mock import MagicMock
+        from management_api import create_management_router
 
-        plugin = HTTPInputPlugin()
-        await plugin.initialize({"host": "127.0.0.1", "port": 8000})
-        plugin.set_db_manager(db_mock)
-        plugin._setup_routes()
-        return TestClient(plugin.app, raise_server_exceptions=False)
+        app = FastAPI()
+        router = create_management_router(
+            db_manager=db_mock,
+            auth_manager=MagicMock(),
+            ldap_manager=MagicMock(),
+            event_bus=MagicMock(),
+            admission_chain=MagicMock(),
+        )
+        app.include_router(router)
+        return TestClient(app, raise_server_exceptions=False)
 
     def _role_response_data(self):
         return {
@@ -472,7 +479,7 @@ class TestCustomRoleEndpoints:
     async def test_create_custom_role(self):
         db = AsyncMock(spec=DatabaseManager)
         db.create_custom_role = AsyncMock(return_value=self._role_response_data())
-        client = await self._make_client(db)
+        client = self._make_client(db)
 
         resp = client.post(
             "/api/v1/custom-roles",
@@ -484,7 +491,7 @@ class TestCustomRoleEndpoints:
 
     async def test_create_custom_role_requires_admin(self):
         db = AsyncMock(spec=DatabaseManager)
-        client = await self._make_client(db)
+        client = self._make_client(db)
 
         non_admin = dict(self.admin, is_admin=False, id=2)
         resp = client.post(
@@ -497,7 +504,7 @@ class TestCustomRoleEndpoints:
     async def test_list_custom_roles(self):
         db = AsyncMock(spec=DatabaseManager)
         db.list_custom_roles = AsyncMock(return_value=[self._role_response_data()])
-        client = await self._make_client(db)
+        client = self._make_client(db)
 
         resp = client.get(
             "/api/v1/custom-roles",
@@ -509,7 +516,7 @@ class TestCustomRoleEndpoints:
     async def test_get_custom_role_not_found(self):
         db = AsyncMock(spec=DatabaseManager)
         db.get_custom_role = AsyncMock(return_value=None)
-        client = await self._make_client(db)
+        client = self._make_client(db)
 
         resp = client.get(
             "/api/v1/custom-roles/999",
@@ -520,7 +527,7 @@ class TestCustomRoleEndpoints:
     async def test_delete_custom_role(self):
         db = AsyncMock(spec=DatabaseManager)
         db.delete_custom_role = AsyncMock(return_value=True)
-        client = await self._make_client(db)
+        client = self._make_client(db)
 
         resp = client.delete(
             "/api/v1/custom-roles/1",
@@ -531,7 +538,7 @@ class TestCustomRoleEndpoints:
     async def test_delete_custom_role_not_found(self):
         db = AsyncMock(spec=DatabaseManager)
         db.delete_custom_role = AsyncMock(return_value=False)
-        client = await self._make_client(db)
+        client = self._make_client(db)
 
         resp = client.delete(
             "/api/v1/custom-roles/999",
@@ -594,20 +601,27 @@ class TestResourceEndpointPermissions:
             "deleted_at": None,
         }
 
-    async def _make_client(self, db_mock):
-        from plugins.inputs.http.api import HTTPInputPlugin
+    def _make_client(self, db_mock):
+        from fastapi import FastAPI
+        from unittest.mock import MagicMock
+        from management_api import create_management_router
 
-        plugin = HTTPInputPlugin()
-        await plugin.initialize({"host": "127.0.0.1", "port": 8000})
-        plugin.set_db_manager(db_mock)
-        plugin._setup_routes()
-        return TestClient(plugin.app, raise_server_exceptions=False)
+        app = FastAPI()
+        router = create_management_router(
+            db_manager=db_mock,
+            auth_manager=MagicMock(),
+            ldap_manager=MagicMock(),
+            event_bus=MagicMock(),
+            admission_chain=MagicMock(),
+        )
+        app.include_router(router)
+        return TestClient(app, raise_server_exceptions=False)
 
     async def test_get_resource_admin_always_allowed(self):
         db = AsyncMock(spec=DatabaseManager)
         db.get_resource = AsyncMock(return_value=self._resource())
         db.get_custom_role_permissions = AsyncMock(return_value=[])
-        client = await self._make_client(db)
+        client = self._make_client(db)
 
         resp = client.get(
             "/api/v1/resources/1",
@@ -619,7 +633,7 @@ class TestResourceEndpointPermissions:
         db = AsyncMock(spec=DatabaseManager)
         db.get_resource = AsyncMock(return_value=self._resource())
         db.get_custom_role_permissions = AsyncMock(return_value=[])
-        client = await self._make_client(db)
+        client = self._make_client(db)
 
         resp = client.get(
             "/api/v1/resources/1",
@@ -639,7 +653,7 @@ class TestResourceEndpointPermissions:
                 }
             ]
         )
-        client = await self._make_client(db)
+        client = self._make_client(db)
 
         resp = client.get(
             "/api/v1/resources/1",
@@ -660,7 +674,7 @@ class TestResourceEndpointPermissions:
                 }
             ]
         )
-        client = await self._make_client(db)
+        client = self._make_client(db)
 
         resp = client.get(
             "/api/v1/resources/1",
@@ -691,7 +705,7 @@ class TestResourceEndpointPermissions:
                 }
             ]
         )
-        client = await self._make_client(db)
+        client = self._make_client(db)
 
         resp = client.get(
             "/api/v1/resources",
@@ -715,7 +729,7 @@ class TestResourceEndpointPermissions:
         ]
         db.list_resources = AsyncMock(return_value=resources)
         db.get_custom_role_permissions = AsyncMock(return_value=[])
-        client = await self._make_client(db)
+        client = self._make_client(db)
 
         resp = client.get(
             "/api/v1/resources",

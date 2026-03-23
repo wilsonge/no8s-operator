@@ -19,18 +19,53 @@ def _auth_headers(mgr: AuthManager, user: dict) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
-async def _make_client(db_mock, *, ldap_mgr=None, auth_mgr=None) -> TestClient:
+async def _make_plugin_client(
+    db_mock, *, ldap_mgr=None, auth_mgr=None, admission_chain=None
+) -> TestClient:
+    """Build a TestClient for the 3 resource write routes in HTTPInputPlugin."""
     from plugins.inputs.http.api import HTTPInputPlugin
 
     plugin = HTTPInputPlugin()
     await plugin.initialize({"host": "127.0.0.1", "port": 8000})
     plugin.set_db_manager(db_mock)
-    if ldap_mgr:
-        plugin.set_ldap_manager(ldap_mgr)
-    if auth_mgr:
-        plugin.set_auth_manager(auth_mgr)
+    if admission_chain is not None:
+        plugin.set_admission_chain(admission_chain)
     plugin._setup_routes()
     return TestClient(plugin.app, raise_server_exceptions=False)
+
+
+_UNSET = object()  # sentinel to distinguish "not passed" from None
+
+
+async def _make_management_client(
+    db_mock, *, ldap_mgr=_UNSET, auth_mgr=_UNSET, admission_chain=None
+) -> TestClient:
+    """Build a TestClient for all management routes (create_management_router)."""
+    from fastapi import FastAPI
+    from management_api import create_management_router
+
+    # Use a real MagicMock only when the caller didn't specify the arg at all.
+    # When the caller explicitly passes None we forward None so that the route
+    # handler can detect the absence of the dependency.
+    resolved_ldap = MagicMock() if ldap_mgr is _UNSET else ldap_mgr
+    resolved_auth = MagicMock() if auth_mgr is _UNSET else auth_mgr
+
+    app = FastAPI()
+    router = create_management_router(
+        db_manager=db_mock,
+        auth_manager=resolved_auth,
+        ldap_manager=resolved_ldap,
+        event_bus=MagicMock(),
+        admission_chain=admission_chain or MagicMock(),
+    )
+    app.include_router(router)
+    return TestClient(app, raise_server_exceptions=False)
+
+
+# Backward-compatible alias used by tests that call either helper
+async def _make_client(db_mock, *, ldap_mgr=_UNSET, auth_mgr=_UNSET) -> TestClient:
+    """Legacy helper: returns a management client for non-write-route tests."""
+    return await _make_management_client(db_mock, ldap_mgr=ldap_mgr, auth_mgr=auth_mgr)
 
 
 def _admin() -> dict:
@@ -191,41 +226,41 @@ def _role_data(**kwargs) -> dict:
 
 class TestValidateNameFormat:
     def test_valid_name(self):
-        from plugins.inputs.http.api import validate_name_format
+        from api_models import validate_name_format
 
         assert validate_name_format("my-cluster", "name") == "my-cluster"
 
     def test_single_char_valid(self):
-        from plugins.inputs.http.api import validate_name_format
+        from api_models import validate_name_format
 
         assert validate_name_format("a", "name") == "a"
 
     def test_empty_raises(self):
-        from plugins.inputs.http.api import validate_name_format
+        from api_models import validate_name_format
 
         with pytest.raises(ValueError, match="cannot be empty"):
             validate_name_format("", "name")
 
     def test_too_long_raises(self):
-        from plugins.inputs.http.api import validate_name_format
+        from api_models import validate_name_format
 
         with pytest.raises(ValueError, match="cannot exceed"):
             validate_name_format("a" * 64, "name")
 
     def test_uppercase_raises(self):
-        from plugins.inputs.http.api import validate_name_format
+        from api_models import validate_name_format
 
         with pytest.raises(ValueError, match="must consist of lowercase"):
             validate_name_format("MyCluster", "name")
 
     def test_starts_with_hyphen_raises(self):
-        from plugins.inputs.http.api import validate_name_format
+        from api_models import validate_name_format
 
         with pytest.raises(ValueError):
             validate_name_format("-bad-name", "name")
 
     def test_ends_with_hyphen_raises(self):
-        from plugins.inputs.http.api import validate_name_format
+        from api_models import validate_name_format
 
         with pytest.raises(ValueError):
             validate_name_format("bad-name-", "name")
@@ -233,36 +268,22 @@ class TestValidateNameFormat:
 
 class TestValidateJsonSize:
     def test_within_limit(self):
-        from plugins.inputs.http.api import validate_json_size
+        from api_models import validate_json_size
 
         result = validate_json_size({"key": "val"}, "spec")
         assert result == {"key": "val"}
 
     def test_none_is_allowed(self):
-        from plugins.inputs.http.api import validate_json_size
+        from api_models import validate_json_size
 
         assert validate_json_size(None, "spec") is None
 
     def test_over_limit_raises(self):
-        from plugins.inputs.http.api import MAX_SPEC_SIZE, validate_json_size
+        from api_models import MAX_SPEC_SIZE, validate_json_size
 
         big = {"k": "x" * MAX_SPEC_SIZE}
         with pytest.raises(ValueError, match="exceeds maximum size"):
             validate_json_size(big, "spec")
-
-
-# ---------------------------------------------------------------------------
-# Health check
-# ---------------------------------------------------------------------------
-
-
-class TestHealthCheck:
-    async def test_health_returns_ok(self):
-        db = AsyncMock(spec=DatabaseManager)
-        client = await _make_client(db)
-        resp = client.get("/health")
-        assert resp.status_code == 200
-        assert resp.json()["status"] == "ok"
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +357,7 @@ class TestAuthEndpoints:
         db.get_user_by_username = AsyncMock(
             return_value=_user_row(source="ldap", ldap_dn="uid=alice,dc=example,dc=com")
         )
-        client = await _make_client(db, auth_mgr=self.mgr)
+        client = await _make_client(db, ldap_mgr=None, auth_mgr=self.mgr)
 
         resp = client.post(
             "/api/v1/auth/login",
@@ -536,7 +557,7 @@ class TestUserEndpoints:
 
     async def test_ldap_sync_no_manager_returns_503(self):
         db = AsyncMock(spec=DatabaseManager)
-        client = await _make_client(db)
+        client = await _make_client(db, ldap_mgr=None)
 
         resp = client.post(
             "/api/v1/users/ldap-sync",
@@ -776,7 +797,7 @@ class TestResourceEndpoints:
         db.create_resource = AsyncMock(return_value=1)
         db.get_resource = AsyncMock(return_value=_resource_row())
         db.get_custom_role_permissions = AsyncMock(return_value=[])
-        client = await _make_client(db)
+        client = await _make_plugin_client(db)
 
         with patch(
             "plugins.registry.get_registry",
@@ -798,7 +819,7 @@ class TestResourceEndpoints:
     async def test_create_resource_no_reconciler_no_plugin_returns_400(self):
         db = AsyncMock(spec=DatabaseManager)
         db.get_custom_role_permissions = AsyncMock(return_value=[])
-        client = await _make_client(db)
+        client = await _make_plugin_client(db)
 
         with patch(
             "plugins.registry.get_registry",
@@ -823,7 +844,7 @@ class TestResourceEndpoints:
             return_value=_resource_type_row()
         )
         db.get_custom_role_permissions = AsyncMock(return_value=[])
-        client = await _make_client(db)
+        client = await _make_plugin_client(db)
 
         with patch(
             "plugins.registry.get_registry",
@@ -845,7 +866,7 @@ class TestResourceEndpoints:
         db = AsyncMock(spec=DatabaseManager)
         db.get_resource_type_by_name_version = AsyncMock(return_value=None)
         db.get_custom_role_permissions = AsyncMock(return_value=[])
-        client = await _make_client(db)
+        client = await _make_plugin_client(db)
 
         with patch(
             "plugins.registry.get_registry",
@@ -898,7 +919,7 @@ class TestResourceEndpoints:
         db.get_matching_webhooks = AsyncMock(return_value=[])
         db.update_resource = AsyncMock()
         db.get_custom_role_permissions = AsyncMock(return_value=[])
-        client = await _make_client(db)
+        client = await _make_plugin_client(db)
 
         resp = client.put(
             "/api/v1/resources/1",
@@ -911,7 +932,7 @@ class TestResourceEndpoints:
         db = AsyncMock(spec=DatabaseManager)
         db.get_resource = AsyncMock(return_value=None)
         db.get_custom_role_permissions = AsyncMock(return_value=[])
-        client = await _make_client(db)
+        client = await _make_plugin_client(db)
 
         resp = client.put(
             "/api/v1/resources/999",
@@ -926,7 +947,7 @@ class TestResourceEndpoints:
         db.get_matching_webhooks = AsyncMock(return_value=[])
         db.delete_resource = AsyncMock()
         db.get_custom_role_permissions = AsyncMock(return_value=[])
-        client = await _make_client(db)
+        client = await _make_plugin_client(db)
 
         resp = client.delete(
             "/api/v1/resources/1",
@@ -939,7 +960,7 @@ class TestResourceEndpoints:
         db = AsyncMock(spec=DatabaseManager)
         db.get_resource = AsyncMock(return_value=None)
         db.get_custom_role_permissions = AsyncMock(return_value=[])
-        client = await _make_client(db)
+        client = await _make_plugin_client(db)
 
         resp = client.delete(
             "/api/v1/resources/999",

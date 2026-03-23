@@ -9,6 +9,7 @@ import logging
 import signal
 from typing import Any, Dict, List, Optional
 
+from admission import AdmissionChain
 from auth import AuthManager, set_auth_manager
 from cluster_status import create_cluster_status_router
 from config import get_config
@@ -17,6 +18,7 @@ from db import DatabaseManager
 from events import EventBus
 from ldap_sync import LDAPSyncManager
 from leader_election import LeaderElection
+from management_api import create_management_router
 from plugins.registry import get_registry, register_builtin_plugins
 from plugins.inputs.base import InputPlugin
 
@@ -39,6 +41,7 @@ class Application:
         self.auth_manager: Optional[AuthManager] = None
         self.ldap_manager: Optional[LDAPSyncManager] = None
         self.leader_election: Optional[LeaderElection] = None
+        self.admission_chain: Optional[AdmissionChain] = None
         self.running = False
 
     async def initialize(self):
@@ -156,6 +159,15 @@ class Application:
             db_manager=self.db,
         )
 
+        self.admission_chain = AdmissionChain(self.db)
+        management_router = create_management_router(
+            db_manager=self.db,
+            auth_manager=self.auth_manager,
+            ldap_manager=self.ldap_manager,
+            event_bus=self.event_bus,
+            admission_chain=self.admission_chain,
+        )
+
         # Determine which input plugins to load
         enabled_inputs = self.config.plugins.enabled_input_plugins
         if not enabled_inputs:
@@ -179,7 +191,10 @@ class Application:
                 plugin.set_auth_manager(self.auth_manager)
             if hasattr(plugin, "set_ldap_manager") and self.ldap_manager:
                 plugin.set_ldap_manager(self.ldap_manager)
+            if hasattr(plugin, "set_admission_chain"):
+                plugin.set_admission_chain(self.admission_chain)
             plugin.mount_router(cluster_status_router)
+            plugin.mount_router(management_router)
             self.input_plugins.append(plugin)
             logger.info(f"Initialized input plugin: {plugin_name}")
 

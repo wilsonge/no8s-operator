@@ -1,12 +1,11 @@
 """Unit tests for main.py - Application lifecycle."""
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch, call
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from main import Application
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -30,6 +29,7 @@ def _make_mock_input_plugin():
     plugin.set_event_bus = MagicMock()
     plugin.set_auth_manager = MagicMock()
     plugin.set_ldap_manager = MagicMock()
+    plugin.set_admission_chain = MagicMock()
     plugin.mount_router = MagicMock()
     plugin.start = AsyncMock()
     plugin.stop = AsyncMock()
@@ -68,6 +68,7 @@ class TestApplicationInit:
         assert app.auth_manager is None
         assert app.ldap_manager is None
         assert app.leader_election is None
+        assert app.admission_chain is None
         assert app.running is False
 
 
@@ -130,6 +131,8 @@ class TestApplicationInitialize:
             patch("main.EventBus"),
             patch("main.LeaderElection"),
             patch("main.create_cluster_status_router"),
+            patch("main.AdmissionChain"),
+            patch("main.create_management_router"),
         ):
             mock_ldap_cls.return_value.is_configured.return_value = False
             app = Application()
@@ -153,6 +156,8 @@ class TestApplicationInitialize:
             patch("main.EventBus"),
             patch("main.LeaderElection"),
             patch("main.create_cluster_status_router"),
+            patch("main.AdmissionChain"),
+            patch("main.create_management_router"),
         ):
             mock_ldap_cls.return_value.is_configured.return_value = False
             app = Application()
@@ -176,6 +181,8 @@ class TestApplicationInitialize:
             patch("main.EventBus"),
             patch("main.LeaderElection"),
             patch("main.create_cluster_status_router"),
+            patch("main.AdmissionChain"),
+            patch("main.create_management_router"),
         ):
             mock_ldap_cls.return_value.is_configured.return_value = False
             app = Application()
@@ -209,6 +216,8 @@ class TestApplicationInitialize:
             patch("main.EventBus"),
             patch("main.LeaderElection"),
             patch("main.create_cluster_status_router"),
+            patch("main.AdmissionChain"),
+            patch("main.create_management_router"),
         ):
             mock_ldap_cls.return_value.is_configured.return_value = False
             app = Application()
@@ -240,6 +249,8 @@ class TestApplicationInitialize:
             patch("main.EventBus"),
             patch("main.LeaderElection"),
             patch("main.create_cluster_status_router"),
+            patch("main.AdmissionChain"),
+            patch("main.create_management_router"),
         ):
             mock_ldap_cls.return_value.is_configured.return_value = False
             app = Application()
@@ -264,6 +275,8 @@ class TestApplicationInitialize:
             patch("main.EventBus"),
             patch("main.LeaderElection"),
             patch("main.create_cluster_status_router"),
+            patch("main.AdmissionChain"),
+            patch("main.create_management_router"),
         ):
             mock_ldap_cls.return_value.is_configured.return_value = False
             app = Application()
@@ -290,9 +303,13 @@ class TestApplicationInitialize:
             patch("main.EventBus") as mock_event_bus_cls,
             patch("main.LeaderElection"),
             patch("main.create_cluster_status_router"),
+            patch("main.AdmissionChain") as mock_admission_chain_cls,
+            patch("main.create_management_router") as mock_create_mgmt_router,
         ):
             mock_event_bus = MagicMock()
             mock_event_bus_cls.return_value = mock_event_bus
+            mock_admission_chain = MagicMock()
+            mock_admission_chain_cls.return_value = mock_admission_chain
 
             app = Application()
             await app.initialize()
@@ -301,6 +318,19 @@ class TestApplicationInitialize:
         mock_input_plugin.set_event_bus.assert_called_once_with(mock_event_bus)
         mock_input_plugin.set_auth_manager.assert_called_once_with(mock_auth)
         mock_input_plugin.set_ldap_manager.assert_called_once_with(mock_ldap)
+        mock_input_plugin.set_admission_chain.assert_called_once_with(
+            mock_admission_chain
+        )
+        # mount_router should be called twice: cluster_status + management
+        assert mock_input_plugin.mount_router.call_count == 2
+        mock_admission_chain_cls.assert_called_once_with(mock_db)
+        mock_create_mgmt_router.assert_called_once_with(
+            db_manager=mock_db,
+            auth_manager=mock_auth,
+            ldap_manager=mock_ldap,
+            event_bus=mock_event_bus,
+            admission_chain=mock_admission_chain,
+        )
         assert mock_input_plugin in app.input_plugins
 
     async def test_unknown_input_plugin_skipped(self, mock_config):
@@ -320,6 +350,8 @@ class TestApplicationInitialize:
             patch("main.EventBus"),
             patch("main.LeaderElection"),
             patch("main.create_cluster_status_router"),
+            patch("main.AdmissionChain"),
+            patch("main.create_management_router"),
         ):
             mock_ldap_cls.return_value.is_configured.return_value = False
             app = Application()
@@ -342,6 +374,8 @@ class TestApplicationInitialize:
             patch("main.EventBus"),
             patch("main.LeaderElection"),
             patch("main.create_cluster_status_router"),
+            patch("main.AdmissionChain"),
+            patch("main.create_management_router"),
         ):
             mock_ldap_cls.return_value.is_configured.return_value = False
             app = Application()
@@ -365,12 +399,16 @@ class TestApplicationInitialize:
             patch("main.EventBus"),
             patch("main.LeaderElection", return_value=mock_le) as mock_le_cls,
             patch("main.create_cluster_status_router"),
+            patch("main.AdmissionChain"),
+            patch("main.create_management_router"),
         ):
             mock_ldap_cls.return_value.is_configured.return_value = False
             app = Application()
             await app.initialize()
 
-        mock_le_cls.assert_called_once_with(db=mock_db, config=mock_config.leader_election)
+        mock_le_cls.assert_called_once_with(
+            db=mock_db, config=mock_config.leader_election
+        )
         assert app.leader_election is mock_le
 
 

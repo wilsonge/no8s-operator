@@ -7,7 +7,6 @@ from unittest.mock import patch
 from plugins.secrets.base import SecretStorePlugin
 from plugins.secrets.env import EnvSecretStore
 
-
 # ---------------------------------------------------------------------------
 # SecretStorePlugin ABC
 # ---------------------------------------------------------------------------

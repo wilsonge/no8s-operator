@@ -1,13 +1,12 @@
 """Unit tests for plugins/registry.py - PluginRegistry action/input/secret coverage."""
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
 from plugins.registry import PluginRegistry, get_registry, reset_registry
 from plugins.actions.base import ActionPlugin
 from plugins.inputs.base import InputPlugin
 from plugins.secrets.base import SecretStorePlugin
-
 
 # ---------------------------------------------------------------------------
 # Minimal concrete implementations for testing
@@ -165,6 +164,7 @@ class TestActionPluginRegistration:
 
     def test_overwrite_action_plugin_warns(self, caplog):
         import logging
+
         registry = PluginRegistry()
         registry.register_action_plugin(DummyActionPlugin)
         with caplog.at_level(logging.WARNING):
@@ -190,7 +190,9 @@ class TestActionPluginRegistration:
 
     def test_get_action_plugin_config_loaded_on_registration(self):
         registry = PluginRegistry()
-        with patch.object(DummyActionPlugin, "load_config_from_env", return_value={"key": "val"}):
+        with patch.object(
+            DummyActionPlugin, "load_config_from_env", return_value={"key": "val"}
+        ):
             registry.register_action_plugin(DummyActionPlugin)
         assert registry.get_action_plugin_config("dummy_action") == {"key": "val"}
 
@@ -270,6 +272,7 @@ class TestInputPluginRegistration:
 
     def test_overwrite_input_plugin_warns(self, caplog):
         import logging
+
         registry = PluginRegistry()
         registry.register_input_plugin(DummyInputPlugin)
         with caplog.at_level(logging.WARNING):
@@ -327,6 +330,7 @@ class TestSecretStorePluginRegistration:
 
     def test_overwrite_secret_store_warns(self, caplog):
         import logging
+
         registry = PluginRegistry()
         registry.register_secret_store_plugin(DummySecretStore)
         with caplog.at_level(logging.WARNING):
