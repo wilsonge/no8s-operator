@@ -61,3 +61,5 @@ nav:
   - Extending:
     - Writing a Reconciler: writing-a-reconciler.md
     - Action Plugins: action-plugins.md
+  - Examples:
+    - Cross-Region PostgreSQL Failover: examples/postgresql-cluster-failover.md
