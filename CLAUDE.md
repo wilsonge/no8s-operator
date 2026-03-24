@@ -21,3 +21,6 @@ pytest tests/
 ### Documentation
 
 When making changes ensure the documentation in the `docs/` folder and this architecture document are updated.
+
+Examples in the docs/examples/ folder should be relatively high level and explain practical concepts without going into
+low level programming.
